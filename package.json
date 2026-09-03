@@ -1,0 +1,38 @@
+{
+  "name": "rogue",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Autonomous, database-defined Rogue agents built with the Pi framework",
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build": "npm run typecheck && node scripts/build.mjs",
+    "bundle": "node scripts/build.mjs",
+    "auth": "tsx src/cli.ts --auth",
+    "start": "node dist/rogue.js",
+    "dev": "tsx src/cli.ts",
+    "autonomous": "tsx src/cli.ts",
+    "interactive": "tsx src/cli.ts --interactive",
+    "test": "vitest run",
+    "check": "npm run typecheck && vitest run"
+  },
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "0.84.4",
+    "@earendil-works/pi-ai": "0.84.4",
+    "@earendil-works/pi-coding-agent": "0.84.4",
+    "@faker-js/faker": "^10.6.0",
+    "nostr-tools": "^2.25.1",
+    "ws": "^8.21.3"
+  },
+  "devDependencies": {
+    "@types/node": "22.19.19",
+    "@types/ws": "^8.18.1",
+    "esbuild": "^0.28.2",
+    "tsx": "4.20.6",
+    "typescript": "5.9.3",
+    "vitest": "4.1.9"
+  }
+}

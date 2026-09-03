@@ -1,0 +1,6 @@
+node_modules/
+dist/
+.rogue/
+*.log
+initial_auth.json
+rogue-bootstrap.zip

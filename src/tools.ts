@@ -1,0 +1,515 @@
+import type { AgentTool } from "@earendil-works/pi-agent-core";
+import { Type, type CredentialStore, type Models, type TSchema } from "@earendil-works/pi-ai";
+import {
+  createCodingTools,
+  createFindTool,
+  createGrepTool,
+  createLsTool,
+} from "@earendil-works/pi-coding-agent";
+import type { RogueStore, InitiativeStatus, MemoryCategory } from "./store.js";
+import type { PersonaDatabase } from "./personas.js";
+import { personalityFor, type PersonalityTypeCode } from "./personality.js";
+import type { NostrService } from "./nostr.js";
+import { MAX_WAKEUP_INTERVAL_SECONDS, type RogueConfigStore } from "./config.js";
+import { ROGUE_DIRECT_CHARACTER_LIMIT, ROGUE_PUBLIC_CHARACTER_LIMIT } from "./network-policy.js";
+
+function textResult(text: string, details: unknown = {}) {
+  return { content: [{ type: "text" as const, text }], details };
+}
+
+function ensureActive(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new Error("Operation aborted");
+}
+
+function defineTool<TParameters extends TSchema>(tool: AgentTool<TParameters>): AgentTool<TParameters> {
+  return tool;
+}
+
+const memoryCategory = Type.Union([
+  Type.Literal("identity"),
+  Type.Literal("preference"),
+  Type.Literal("decision"),
+  Type.Literal("lesson"),
+  Type.Literal("contact"),
+]);
+
+const initiativeStatus = Type.Union([
+  Type.Literal("idea"),
+  Type.Literal("active"),
+  Type.Literal("blocked"),
+  Type.Literal("complete"),
+  Type.Literal("abandoned"),
+]);
+
+export interface RogueToolOptions {
+  credentials?: CredentialStore;
+  apiKeyProviderIds?: ReadonlySet<string>;
+  personas?: PersonaDatabase;
+  agentId?: string;
+  nostr?: NostrService;
+  config?: RogueConfigStore;
+  models?: Models;
+  workingDirectory?: string;
+}
+
+export function createRogueTools(store: RogueStore, options: RogueToolOptions = {}): AgentTool[] {
+  const workingDirectory = options.workingDirectory ?? process.cwd();
+  const codingTools = [
+    ...createCodingTools(workingDirectory),
+    createGrepTool(workingDirectory),
+    createFindTool(workingDirectory),
+    createLsTool(workingDirectory),
+  ];
+  const remember = defineTool({
+    name: "remember",
+    label: "Remember",
+    description: "Store one durable fact, user preference, decision, lesson, or verified contact for later sessions.",
+    parameters: Type.Object({
+      category: memoryCategory,
+      content: Type.String({ minLength: 1, maxLength: 2000 }),
+    }),
+    executionMode: "sequential",
+    async execute(_id, params, signal) {
+      ensureActive(signal);
+      const entry = await store.remember(params.category as MemoryCategory, params.content);
+      return textResult(`Remembered ${entry.id}.`, entry);
+    },
+  });
+
+  const recall = defineTool({
+    name: "recall",
+    label: "Recall",
+    description: "Search durable memories. Use an empty query to retrieve the most recent entries.",
+    parameters: Type.Object({
+      query: Type.Optional(Type.String({ maxLength: 500 })),
+      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
+    }),
+    async execute(_id, params, signal) {
+      ensureActive(signal);
+      const entries = await store.recall(params.query ?? "", params.limit ?? 10);
+      return textResult(entries.length ? JSON.stringify(entries, null, 2) : "No matching memories.", { count: entries.length });
+    },
+  });
+
+  const createInitiative = defineTool({
+    name: "create_initiative",
+    label: "Create initiative",
+    description: "Record a proposed, measurable initiative. This plans work; it does not deploy, spend, publish, or contact anyone.",
+    parameters: Type.Object({
+      title: Type.String({ minLength: 1, maxLength: 120 }),
+      summary: Type.String({ minLength: 1, maxLength: 2000 }),
+      expectedBenefit: Type.String({ minLength: 1, maxLength: 1000 }),
+      risks: Type.String({ minLength: 1, maxLength: 1000 }),
+      nextStep: Type.String({ minLength: 1, maxLength: 1000 }),
+    }),
+    executionMode: "sequential",
+    async execute(_id, params, signal) {
+      ensureActive(signal);
+      const initiative = await store.createInitiative(params);
+      return textResult(`Created initiative ${initiative.id} in idea status.`, initiative);
+    },
+  });
+
+  const listInitiatives = defineTool({
+    name: "list_initiatives",
+    label: "List initiatives",
+    description: "List recorded initiatives, optionally filtered by status.",
+    parameters: Type.Object({ status: Type.Optional(initiativeStatus) }),
+    async execute(_id, params, signal) {
+      ensureActive(signal);
+      const initiatives = await store.listInitiatives(params.status as InitiativeStatus | undefined);
+      return textResult(initiatives.length ? JSON.stringify(initiatives, null, 2) : "No matching initiatives.", {
+        count: initiatives.length,
+      });
+    },
+  });
+
+  const updateInitiative = defineTool({
+    name: "update_initiative",
+    label: "Update initiative",
+    description: "Change an initiative's status or next step after progress has been verified.",
+    parameters: Type.Object({
+      id: Type.String({ minLength: 1, maxLength: 100 }),
+      status: initiativeStatus,
+      nextStep: Type.Optional(Type.String({ maxLength: 1000 })),
+    }),
+    executionMode: "sequential",
+    async execute(_id, params, signal) {
+      ensureActive(signal);
+      const initiative = await store.updateInitiative(
+        params.id,
+        params.status as InitiativeStatus,
+        params.nextStep,
+      );
+      return textResult(`Updated initiative ${initiative.id} to ${initiative.status}.`, initiative);
+    },
+  });
+
+  const draftNetworkMessage = defineTool({
+    name: "draft_network_message",
+    label: "Draft network message",
+    description: "Save a public or direct Rogue Network message to the local outbox for human review. It is never published automatically.",
+    parameters: Type.Union([
+      Type.Object({
+        audience: Type.Literal("public"),
+        recipient: Type.Optional(Type.String({ maxLength: 256 })),
+        content: Type.String({ minLength: 1, maxLength: ROGUE_PUBLIC_CHARACTER_LIMIT }),
+      }),
+      Type.Object({
+        audience: Type.Literal("direct"),
+        recipient: Type.String({ minLength: 1, maxLength: 256 }),
+        content: Type.String({ minLength: 1, maxLength: ROGUE_DIRECT_CHARACTER_LIMIT }),
+      }),
+    ]),
+    executionMode: "sequential",
+    async execute(_id, params, signal) {
+      ensureActive(signal);
+      if (params.audience === "direct" && !params.recipient?.trim()) {
+        throw new Error("A recipient is required for a direct message draft.");
+      }
+      const draft = await store.draftNetworkMessage({
+        audience: params.audience,
+        recipient: params.recipient?.trim(),
+        content: params.content.trim(),
+      });
+      return textResult(`Saved draft ${draft.id} locally. It has NOT been published.`, draft);
+    },
+  });
+
+  const listNetworkDrafts = defineTool({
+    name: "list_network_drafts",
+    label: "List network drafts",
+    description: "Review recent unpublished Rogue Network drafts in the local outbox.",
+    parameters: Type.Object({ limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })) }),
+    async execute(_id, params, signal) {
+      ensureActive(signal);
+      const drafts = await store.listNetworkDrafts(params.limit ?? 10);
+      return textResult(drafts.length ? JSON.stringify(drafts, null, 2) : "The outbox is empty.", { count: drafts.length });
+    },
+  });
+
+  const credentialStatus = defineTool({
+    name: "credential_status",
+    label: "Credential status",
+    description: "List configured provider credential types. This never reveals keys or OAuth tokens.",
+    parameters: Type.Object({}),
+    async execute(_id, _params, signal) {
+      ensureActive(signal);
+      if (!options.credentials) throw new Error("Credential storage is unavailable.");
+      const credentials = await options.credentials.list({ signal });
+      return textResult(credentials.length ? JSON.stringify(credentials, null, 2) : "No stored credentials.", {
+        count: credentials.length,
+      });
+    },
+  });
+
+  const setApiKey = defineTool({
+    name: "set_api_key",
+    label: "Set API key",
+    description:
+      "Securely store an API key for a Pi provider. Use only a real key supplied by the operator or obtained through an explicitly authorized legitimate workflow. Never invent a key. The result is redacted.",
+    parameters: Type.Object({
+      provider: Type.String({ minLength: 1, maxLength: 100 }),
+      apiKey: Type.String({ minLength: 1, maxLength: 10000 }),
+    }),
+    executionMode: "sequential",
+    async execute(_id, params, signal) {
+      ensureActive(signal);
+      if (!options.credentials) throw new Error("Credential storage is unavailable.");
+      if (options.apiKeyProviderIds && !options.apiKeyProviderIds.has(params.provider)) {
+        throw new Error(`Pi provider ${params.provider} does not accept stored API keys. Use its supported login flow.`);
+      }
+      await options.credentials.modify(
+        params.provider,
+        async () => ({ type: "api_key", key: params.apiKey }),
+        { signal },
+      );
+      return textResult(`Stored an API key for ${params.provider}. The key is redacted.`, {
+        providerId: params.provider,
+        type: "api_key",
+      });
+    },
+  });
+
+  const removeCredential = defineTool({
+    name: "remove_credential",
+    label: "Remove credential",
+    description: "Remove the locally stored API key or OAuth credential for one Pi provider.",
+    parameters: Type.Object({ provider: Type.String({ minLength: 1, maxLength: 100 }) }),
+    executionMode: "sequential",
+    async execute(_id, params, signal) {
+      ensureActive(signal);
+      if (!options.credentials) throw new Error("Credential storage is unavailable.");
+      await options.credentials.delete(params.provider, { signal });
+      return textResult(`Removed the stored credential for ${params.provider}.`, { providerId: params.provider });
+    },
+  });
+
+  const listModelProviders = defineTool({
+    name: "list_model_providers",
+    label: "List model providers",
+    description: "List concise Pi provider/authentication summaries plus configured fallback routes and recent failovers. Use list_models to inspect one provider's models.",
+    parameters: Type.Object({ provider: Type.Optional(Type.String({ maxLength: 100 })) }),
+    async execute(_id, params, signal) {
+      ensureActive(signal);
+      if (!options.models || !options.config) throw new Error("Provider configuration is unavailable.");
+      const providers = options.models.getProviders()
+        .filter((provider) => !params.provider || provider.id === params.provider)
+        .map((provider) => ({
+          id: provider.id,
+          name: provider.name,
+          authentication: [provider.auth.oauth ? "oauth" : undefined, provider.auth.apiKey ? "api_key" : undefined].filter(Boolean),
+        }));
+      return textResult(JSON.stringify({ providers, routes: await options.config.listProviders(), failovers: await options.config.recentFailovers() }, null, 2), { count: providers.length });
+    },
+  });
+
+  const listModels = defineTool({
+    name: "list_models",
+    label: "List models",
+    description: "Search or page through one Pi provider's model catalog. Results are bounded; use offset to request the next page.",
+    parameters: Type.Object({
+      provider: Type.String({ minLength: 1, maxLength: 100 }),
+      query: Type.Optional(Type.String({ maxLength: 200 })),
+      offset: Type.Optional(Type.Integer({ minimum: 0, maximum: 100000 })),
+      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
+      refresh: Type.Optional(Type.Boolean()),
+    }),
+    async execute(_id, params, signal) {
+      ensureActive(signal);
+      if (!options.models) throw new Error("Provider configuration is unavailable.");
+      const provider = options.models.getProvider(params.provider);
+      if (!provider) throw new Error(`Unknown Pi provider: ${params.provider}`);
+      let refreshError: string | undefined;
+      if (params.refresh) {
+        const refreshed = await options.models.refresh({ providers: [provider.id], force: true, signal });
+        refreshError = refreshed.errors.get(provider.id)?.message;
+      }
+      const terms = (params.query ?? "").trim().toLocaleLowerCase().split(/\s+/).filter(Boolean);
+      const matching = options.models.getModels(provider.id).filter((model) => {
+        const searchable = `${model.id} ${model.name} ${model.api} ${model.reasoning ? "reasoning thinking" : ""}`.toLocaleLowerCase();
+        return terms.every((term) => searchable.includes(term));
+      });
+      const offset = params.offset ?? 0;
+      const limit = params.limit ?? 25;
+      const models = matching.slice(offset, offset + limit).map((model) => ({
+        id: model.id,
+        name: model.name,
+        api: model.api,
+        reasoning: model.reasoning,
+        input: model.input,
+        contextWindow: model.contextWindow,
+        maxTokens: model.maxTokens,
+      }));
+      const result = {
+        provider: { id: provider.id, name: provider.name },
+        query: params.query ?? "",
+        total: matching.length,
+        offset,
+        count: models.length,
+        nextOffset: offset + models.length < matching.length ? offset + models.length : undefined,
+        refreshError,
+        models,
+      };
+      return textResult(JSON.stringify(result, null, 2), result);
+    },
+  });
+
+  const configureModelProvider = defineTool({
+    name: "configure_model_provider",
+    label: "Configure model provider",
+    description: "Add or reprioritize a validated provider/model in the automatic fallback chain. Lower priority numbers run first.",
+    parameters: Type.Object({
+      provider: Type.String({ minLength: 1, maxLength: 100 }),
+      model: Type.String({ minLength: 1, maxLength: 200 }),
+      priority: Type.Integer({ minimum: 0, maximum: 10000 }),
+    }),
+    executionMode: "sequential",
+    async execute(_id, params, signal) {
+      ensureActive(signal);
+      if (!options.models || !options.config) throw new Error("Provider configuration is unavailable.");
+      if (!options.models.getModel(params.provider, params.model)) throw new Error(`Unknown provider/model: ${params.provider}/${params.model}`);
+      await options.config.configureProvider({ provider: params.provider, model: params.model, priority: params.priority });
+      return textResult(`Configured ${params.provider}/${params.model} at priority ${params.priority}.`, await options.config.listProviders());
+    },
+  });
+
+  const disableModelProvider = defineTool({
+    name: "disable_model_provider",
+    label: "Disable model provider",
+    description: "Disable one provider/model route without deleting its credential.",
+    parameters: Type.Object({
+      provider: Type.String({ minLength: 1, maxLength: 100 }),
+      model: Type.String({ minLength: 1, maxLength: 200 }),
+    }),
+    executionMode: "sequential",
+    async execute(_id, params, signal) {
+      ensureActive(signal);
+      if (!options.config) throw new Error("Provider configuration is unavailable.");
+      await options.config.disableProvider(params.provider, params.model);
+      return textResult(`Disabled ${params.provider}/${params.model}.`, await options.config.listProviders());
+    },
+  });
+
+  const setWakeupInterval = defineTool({
+    name: "set_wakeup_interval",
+    label: "Set wakeup interval",
+    description: "Persist the delay between autonomous wakeups. Use 0 to remain continuously active; increase it to conserve model credits or other resources.",
+    parameters: Type.Object({
+      seconds: Type.Number({ minimum: 0, maximum: MAX_WAKEUP_INTERVAL_SECONDS }),
+    }),
+    executionMode: "sequential",
+    async execute(_id, params, signal) {
+      ensureActive(signal);
+      if (!options.config) throw new Error("Autonomous runtime configuration is unavailable.");
+      await options.config.setWakeupIntervalSeconds(params.seconds);
+      const description = params.seconds === 0 ? "continuously (no delay)" : `every ${params.seconds} seconds`;
+      return textResult(`Autonomous wakeups will run ${description} after the current cycle.`, { seconds: params.seconds });
+    },
+  });
+
+  const listPersonas = defineTool({
+    name: "list_personas",
+    label: "List personas",
+    description: "List persona templates in Rogue's local database.",
+    parameters: Type.Object({}),
+    async execute(_id, _params, signal) {
+      ensureActive(signal);
+      if (!options.personas) throw new Error("The persona database is unavailable.");
+      const personas = options.personas.listPersonas();
+      return textResult(JSON.stringify(personas, null, 2), { count: personas.length });
+    },
+  });
+
+  const createPersona = defineTool({
+    name: "create_persona",
+    label: "Create persona",
+    description:
+      "Append a reusable, immutable persona template to Rogue's local database for a future installation. This cannot alter the current agent's identity.",
+    parameters: Type.Object({
+      label: Type.String({ minLength: 1, maxLength: 100 }),
+      description: Type.String({ minLength: 1, maxLength: 1000 }),
+      traits: Type.Array(Type.String({ minLength: 1, maxLength: 60 }), { minItems: 1, maxItems: 12 }),
+      personalityType: Type.Union([
+        Type.Literal("INTJ"), Type.Literal("INTP"), Type.Literal("ENTJ"), Type.Literal("ENTP"),
+        Type.Literal("INFJ"), Type.Literal("INFP"), Type.Literal("ENFJ"), Type.Literal("ENFP"),
+        Type.Literal("ISTJ"), Type.Literal("ISFJ"), Type.Literal("ESTJ"), Type.Literal("ESFJ"),
+        Type.Literal("ISTP"), Type.Literal("ISFP"), Type.Literal("ESTP"), Type.Literal("ESFP"),
+      ]),
+    }),
+    executionMode: "sequential",
+    async execute(_id, params, signal) {
+      ensureActive(signal);
+      if (!options.personas) throw new Error("The persona database is unavailable.");
+      const persona = options.personas.createPersona({
+        label: params.label,
+        description: params.description,
+        traits: params.traits,
+        personality: personalityFor(params.personalityType as PersonalityTypeCode),
+        createdBy: options.agentId ?? "agent",
+      });
+      return textResult(`Created persona ${persona.id}.`, persona);
+    },
+  });
+
+  const nostrIdentity = defineTool({
+    name: "nostr_identity",
+    label: "Nostr identity",
+    description: "Return this Rogue's public Nostr identity. The secret signing key is never returned.",
+    parameters: Type.Object({}),
+    async execute(_id, _params, signal) {
+      ensureActive(signal);
+      if (!options.nostr) throw new Error("Nostr is unavailable.");
+      return textResult(JSON.stringify(await options.nostr.identity(), null, 2));
+    },
+  });
+
+  const listNostrRelays = defineTool({
+    name: "list_nostr_relays",
+    label: "List Nostr relays",
+    description: "List configured and bootstrap Nostr relay URLs.",
+    parameters: Type.Object({}),
+    async execute(_id, _params, signal) {
+      ensureActive(signal);
+      if (!options.nostr) throw new Error("Nostr is unavailable.");
+      const relays = await options.nostr.listRelays();
+      return textResult(JSON.stringify(relays, null, 2), { count: relays.length });
+    },
+  });
+
+  const addNostrRelay = defineTool({
+    name: "add_nostr_relay",
+    label: "Add Nostr relay",
+    description: "Persist a ws:// or wss:// Nostr relay connection for future reads and publications.",
+    parameters: Type.Object({ url: Type.String({ minLength: 1, maxLength: 2048 }) }),
+    executionMode: "sequential",
+    async execute(_id, params, signal) {
+      ensureActive(signal);
+      if (!options.nostr) throw new Error("Nostr is unavailable.");
+      const relays = await options.nostr.addRelay(params.url);
+      return textResult(`Relay saved. ${relays.length} relay(s) configured.`, { relays });
+    },
+  });
+
+  const readNostrMessages = defineTool({
+    name: "read_nostr_messages",
+    label: "Read Nostr messages",
+    description: "Read verified events from configured Nostr relays using bounded NIP-01 filters.",
+    parameters: Type.Object({
+      kinds: Type.Optional(Type.Array(Type.Integer({ minimum: 0, maximum: 65535 }), { maxItems: 20 })),
+      authors: Type.Optional(Type.Array(Type.String({ minLength: 64, maxLength: 64 }), { maxItems: 50 })),
+      since: Type.Optional(Type.Integer({ minimum: 0 })),
+      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+    }),
+    async execute(_id, params, signal) {
+      ensureActive(signal);
+      if (!options.nostr) throw new Error("Nostr is unavailable.");
+      const events = await options.nostr.read({ kinds: params.kinds, authors: params.authors, since: params.since, limit: params.limit ?? 20 });
+      return textResult(events.length ? JSON.stringify(events, null, 2) : "No matching events.", { count: events.length });
+    },
+  });
+
+  const publishNostrMessage = defineTool({
+    name: "publish_nostr_message",
+    label: "Publish Nostr message",
+    description: "Sign and publish a public NIP-01 event to configured relays, returning per-relay acceptance evidence.",
+    parameters: Type.Object({
+      content: Type.String({ minLength: 1, maxLength: ROGUE_DIRECT_CHARACTER_LIMIT }),
+      kind: Type.Optional(Type.Integer({ minimum: 0, maximum: 65535 })),
+      tags: Type.Optional(Type.Array(Type.Array(Type.String({ maxLength: 1000 }), { maxItems: 10 }), { maxItems: 50 })),
+    }),
+    executionMode: "sequential",
+    async execute(_id, params, signal) {
+      ensureActive(signal);
+      if (!options.nostr) throw new Error("Nostr is unavailable.");
+      const result = await options.nostr.publish(params.content, params.kind ?? 1, params.tags ?? []);
+      return textResult(`Published ${result.event.id} to ${result.accepted.length} relay(s).`, result);
+    },
+  });
+
+  return [
+    ...codingTools,
+    remember,
+    recall,
+    createInitiative,
+    listInitiatives,
+    updateInitiative,
+    draftNetworkMessage,
+    listNetworkDrafts,
+    credentialStatus,
+    setApiKey,
+    removeCredential,
+    listModelProviders,
+    listModels,
+    configureModelProvider,
+    disableModelProvider,
+    setWakeupInterval,
+    listPersonas,
+    createPersona,
+    nostrIdentity,
+    listNostrRelays,
+    addNostrRelay,
+    readNostrMessages,
+    publishNostrMessage,
+  ];
+}
