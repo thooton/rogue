@@ -103,6 +103,12 @@ Once the first provider can run the agent, Rogue configures itself with `list_mo
 
 Enabled provider/model routes are ordered by numeric priority. If a request fails because of exhausted credit, quota/rate limits, billing, authentication expiry, provider availability, timeout, or network failure, Rogue buffers the failed attempt, records the transition, notifies the agent in its transcript, and retries through the next configured route. The last 100 transitions are stored in `config.json` for introspection.
 
+## Prompt caching
+
+A Rogue re-sends the same prefix on every request it makes: an immutable system prompt, a fixed tool set, and an append-only transcript. Rogue therefore asks each route for the longest prompt cache retention it offers — `cache_control.ttl: "1h"` on Anthropic-compatible APIs, `prompt_cache_retention: "24h"` on OpenAI-compatible ones — instead of Pi's five-minute default, which expires across a slow tool call, a failure backoff, or a restart. Retention is requested per route, so a fallback provider warms its own cache during a failover rather than inheriting a cold one. Use `--cache-retention short` to fall back to the five-minute default, or `--cache-retention none` for a provider that rejects or mishandles cache markers.
+
+The prompt cache key sent to providers is derived from the installation's agent profile, not from the process, because the conversation is durable and reloaded verbatim: a restarted Rogue resumes against the prefix its provider already holds. Cached prompt tokens are cheaper than uncached ones but never free, and output tokens are never cached, so caching lowers the bill rather than removing it. Every autonomous cycle prints what it actually cost — prompt tokens served from cache, prompt tokens billed at full price, tokens written to the cache, the resulting hit rate, and the provider-reported cost when there is one — and the totals are repeated when autonomy stops. Context compaction deliberately runs uncached: a summarization request has no reusable prefix, so paying to cache one would be pure loss.
+
 ## Identities and personas
 
 Rogue seeds 64 personas: four variants of all 16 MBTI-style personality types. Every persona preserves the original four dichotomies plus the detailed framing for friendliness, honesty, assertiveness, confidence/ego, agreeableness, manners, discipline, rebelliousness, emotional capacity, intelligence, positivity, and activeness/lifestyle. The original ENFP Champion facet values are retained as one catalog entry.

@@ -2,6 +2,7 @@ import {
   createAssistantMessageEventStream,
   type AssistantMessage,
   type AssistantMessageEvent,
+  type CacheRetention,
   type Context,
   type Model,
   type Models,
@@ -9,6 +10,20 @@ import {
   type Api,
 } from "@earendil-works/pi-ai";
 import type { RogueConfigStore } from "./config.js";
+
+/**
+ * Prompt cache retention requested for every agent request.
+ *
+ * A Rogue sends the same growing prefix — system prompt, tool definitions, and
+ * an append-only transcript — on every request it ever makes, so the prefix is
+ * worth keeping cached. Pi defaults to "short", which is a five-minute
+ * Anthropic TTL: long enough for back-to-back turns, but not for a slow tool
+ * call, a failure backoff, or a restart, and those are exactly the gaps an
+ * unattended agent hits. "long" asks for the longest retention each provider
+ * offers (Anthropic `cache_control.ttl: "1h"`, OpenAI `prompt_cache_retention:
+ * "24h"`) so the prefix survives them.
+ */
+export const DEFAULT_CACHE_RETENTION: CacheRetention = "long";
 
 const RECOVERABLE = /credit|quota|billing|payment|402|429|rate.?limit|overload|unavailable|timeout|timed out|network|fetch failed|authentication|api.?key|token expired/i;
 
@@ -69,8 +84,11 @@ export function createFailoverStream(options: {
   primary: Model<Api>;
   /** When false, only the primary route is used and configured fallbacks are ignored. */
   allowFailover?: boolean;
+  /** Prompt cache retention requested per route. Defaults to {@link DEFAULT_CACHE_RETENTION}. */
+  cacheRetention?: CacheRetention;
   onFailover?: (notice: ModelFailoverNotice) => void;
 }) {
+  const cacheRetention = options.cacheRetention ?? DEFAULT_CACHE_RETENTION;
   return (_requestedModel: Model<Api>, context: Context, streamOptions?: SimpleStreamOptions) => {
     const output = createAssistantMessageEventStream();
     void (async () => {
@@ -88,7 +106,14 @@ export function createFailoverStream(options: {
       for (let index = 0; index < candidates.length; index += 1) {
         const model = candidates[index]!;
         const buffered: AssistantMessageEvent[] = [];
-        const source = options.models.streamSimple(model, context, streamOptions);
+        // Every agent request funnels through here, so this is the one place
+        // that has to ask for caching. An explicit caller preference wins; the
+        // agent loop never sets one, which is why Pi's "short" default would
+        // otherwise apply to every request a Rogue makes.
+        const source = options.models.streamSimple(model, context, {
+          ...streamOptions,
+          cacheRetention: streamOptions?.cacheRetention ?? cacheRetention,
+        });
         for await (const event of source) buffered.push(event);
         const terminal = buffered.at(-1);
         if (terminal?.type !== "error") {

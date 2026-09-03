@@ -9,6 +9,7 @@ import { PersonaDatabase, type AgentProfile } from "./personas.js";
 import { NostrService } from "./nostr.js";
 import { RogueConfigStore } from "./config.js";
 import { createFailoverStream, type ModelFailoverNotice } from "./model-router.js";
+import type { CacheRetention } from "@earendil-works/pi-ai";
 import { initializeBundledProviderRuntime } from "./provider-runtime.js";
 import { createAutomaticContextCompactor } from "./context-compaction.js";
 import { isDurableMessage, SessionStore, type RestoredSession } from "./session.js";
@@ -20,6 +21,8 @@ export interface RogueAgentOptions {
   thinkingLevel?: ThinkingLevel;
   /** When false, the selected route is pinned and configured fallbacks are ignored. */
   allowFailover?: boolean;
+  /** Prompt cache retention requested from every provider. Defaults to "long". */
+  cacheRetention?: CacheRetention;
   onFailover?: (notice: ModelFailoverNotice) => void;
   onStateError?: (error: unknown) => void;
 }
@@ -103,12 +106,18 @@ export async function createRogueAgent(options: RogueAgentOptions = {}): Promise
       config,
       primary: model,
       allowFailover: options.allowFailover,
+      cacheRetention: options.cacheRetention,
       onFailover: options.onFailover,
     }),
     convertToLlm,
     transformContext: contextCompactor.transform,
     toolExecution: "parallel",
-    sessionId: `rogue-${profile.id}-${crypto.randomUUID()}`,
+    // Providers use this as their prompt cache key (`prompt_cache_key`, or an
+    // affinity header on backends that route cached prefixes to a replica). The
+    // conversation is durable and reloaded verbatim, so the installation — not
+    // the process — is the session: a fresh id per start pointed every restart
+    // at a cold cache and paid to rewrite a prefix the provider still had.
+    sessionId: `rogue-${profile.id}`,
     afterToolCall: async ({ toolCall, context }) => {
       if (toolCall.name !== "set_api_key") return undefined;
       // Scrub the secret before Pi's automatic follow-up turn reuses this transcript.
