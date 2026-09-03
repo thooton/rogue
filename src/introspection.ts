@@ -1,9 +1,12 @@
 import { createServer, type Server } from "node:http";
 import type { AgentProfile } from "./personas.js";
+import { redactedJson } from "./redaction.js";
 
 export interface IntrospectionSnapshot {
   systemPrompt: string;
   messages: unknown[];
+  /** Older messages left out of this snapshot; they remain in durable state. */
+  earlierMessages?: number;
   events: unknown[];
   compactions?: unknown[];
   error?: string;
@@ -18,11 +21,6 @@ export interface IntrospectionServer {
   close(): Promise<void>;
 }
 
-function safeJson(value: unknown): string {
-  return JSON.stringify(value, (key, item) =>
-    /^(api_?key|secret|access_?token|refresh_?token|authorization)$/i.test(key) ? "<redacted>" : item,
-  );
-}
 
 // Both themes ship: the viewer is often left open next to a terminal all day.
 const DARK_TOKENS = `color-scheme:dark;--bg:#0b0d12;--surface:#12161e;--sunken:#0e1219;--line:#242b38;--line-soft:#1b212c;--text:#e8edf5;--muted:#8d99ab;--accent:#9d8cff;--accent-soft:#9d8cff26;--user:#63a6ff;--user-soft:#63a6ff1f;--ok:#46c78d;--danger:#ff7d85;--shadow:0 1px 2px #0006,0 14px 34px #0000004d`;
@@ -97,7 +95,7 @@ pre.dump{margin:0;padding:10px 14px 14px;max-height:26em;overflow:auto;white-spa
 <script>
 const toolLabels={
 read:a=>'Reading '+(a.path||'a file'),bash:a=>'Running terminal command: '+String(a.command||'').slice(0,100),edit:a=>'Editing '+(a.path||'a file'),write:a=>'Writing '+(a.path||'a file'),grep:a=>'Searching files for '+(a.pattern||'text'),find:a=>'Finding '+(a.pattern||'files'),ls:a=>'Listing '+(a.path||'the working directory'),powershell:a=>'Running PowerShell command: '+String(a.command||'').slice(0,100),
-add_nostr_relay:a=>'Connecting to relay '+(a.url||''),read_nostr_messages:a=>'Reading Rogue Network messages',publish_nostr_message:a=>'Publishing a Rogue Network message',nostr_identity:a=>'Checking the agent network identity',list_nostr_relays:a=>'Reviewing configured relays',remember:a=>'Saving a durable '+(a.category||'')+' memory',recall:a=>'Reviewing durable memory',create_initiative:a=>'Creating initiative: '+(a.title||''),list_initiatives:a=>'Reviewing initiatives',update_initiative:a=>'Updating initiative '+(a.id||''),draft_network_message:a=>'Drafting a '+(a.audience||'network')+' message',list_network_drafts:a=>'Reviewing network drafts',set_wakeup_interval:a=>a.seconds===0?'Keeping the agent continuously active':'Setting wakeups to every '+a.seconds+' seconds',credential_status:a=>'Checking provider credentials',list_model_providers:a=>'Reviewing model providers',list_models:a=>'Browsing '+(a.provider||'provider')+' models'+(a.query?' matching '+a.query:''),configure_model_provider:a=>'Configuring model provider '+(a.provider||''),disable_model_provider:a=>'Disabling model provider '+(a.provider||''),set_api_key:a=>'Securely configuring provider credentials',remove_credential:a=>'Removing provider credentials',list_personas:a=>'Reviewing persona templates',create_persona:a=>'Creating persona template: '+(a.label||'')};
+add_nostr_relay:a=>'Connecting to relay '+(a.url||''),read_nostr_messages:a=>'Reading Rogue Network messages',publish_nostr_message:a=>'Publishing a Rogue Network message',nostr_identity:a=>'Checking the agent network identity',list_nostr_relays:a=>'Reviewing configured relays',remember:a=>'Saving a durable '+(a.category||'')+' memory',recall:a=>'Reviewing durable memory',create_initiative:a=>'Creating initiative: '+(a.title||''),list_initiatives:a=>'Reviewing initiatives',update_initiative:a=>'Updating initiative '+(a.id||''),draft_network_message:a=>'Drafting a '+(a.audience||'network')+' message',list_network_drafts:a=>'Reviewing network drafts',credential_status:a=>'Checking provider credentials',list_model_providers:a=>'Reviewing model providers',list_models:a=>'Browsing '+(a.provider||'provider')+' models'+(a.query?' matching '+a.query:''),configure_model_provider:a=>'Configuring model provider '+(a.provider||''),disable_model_provider:a=>'Disabling model provider '+(a.provider||''),set_api_key:a=>'Securely configuring provider credentials',remove_credential:a=>'Removing provider credentials',list_personas:a=>'Reviewing persona templates',create_persona:a=>'Creating persona template: '+(a.label||'')};
 const byId=id=>document.getElementById(id);
 function make(tag,className,text){const node=document.createElement(tag);if(className)node.className=className;if(text!=null)node.textContent=text;return node}
 function contentText(content){if(typeof content==='string')return content;if(!Array.isArray(content))return content==null?'':JSON.stringify(content,null,2);return content.map(x=>x&&x.type==='text'?x.text:'').filter(Boolean).join('\\n')}
@@ -133,6 +131,7 @@ function render(d){
  const root=byId('messages');root.replaceChildren();
  if(d.error)root.append(make('div','alert',d.error));
  root.append(row('','system-prompt','Complete immutable system prompt','identity',[[null,d.systemPrompt||'System prompt unavailable.']]));
+ if(d.earlierMessages)root.append(make('div','divider',d.earlierMessages+' earlier messages · kept in session-transcript.jsonl'));
  const results=new Map();
  for(const m of d.messages||[])if(m&&m.role==='toolResult')results.set(m.toolCallId,m);
  let visible=0;
@@ -218,7 +217,7 @@ export async function startIntrospectionServer(options: {
     }
     if (request.url === "/api/transcript") {
       response.writeHead(200, { "content-type": "application/json; charset=utf-8" });
-      response.end(safeJson({ profile: options.profile, ...options.getSnapshot() }));
+      response.end(redactedJson({ profile: options.profile, ...options.getSnapshot() }));
     } else if (request.url === "/" || request.url === "/index.html") {
       response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
       response.end(request.method === "HEAD" ? undefined : DASHBOARD);

@@ -9,6 +9,9 @@ import { assertNetworkContent, networkCharacterCount, networkCharacterLimit } fr
 
 useWebSocketImplementation(WebSocket);
 
+// Every Rogue joins the public Rogue Network relay unless it is already stored.
+export const DEFAULT_RELAYS = ["wss://relay.roguenetwork.org"];
+
 function normalizeRelay(value: string): string {
   const url = new URL(value.trim());
   if (url.protocol !== "ws:" && url.protocol !== "wss:") throw new Error("Relay URLs must use ws:// or wss://.");
@@ -20,33 +23,39 @@ export class NostrService {
   private readonly directory: string;
   private readonly relaysPath: string;
   private readonly keyPath: string;
+  private readonly defaultRelays: string[];
 
-  constructor(stateDirectory: string) {
+  // `defaultRelays` exists so tests can run against a local relay only.
+  constructor(stateDirectory: string, options: { defaultRelays?: string[] } = {}) {
     this.directory = path.resolve(stateDirectory);
     this.relaysPath = path.join(this.directory, "nostr-relays.json");
     this.keyPath = path.join(this.directory, "nostr-secret.key");
+    this.defaultRelays = (options.defaultRelays ?? DEFAULT_RELAYS).map(normalizeRelay);
   }
 
   private async ensureDirectory(): Promise<void> {
     await mkdir(this.directory, { recursive: true, mode: 0o700 });
   }
 
-  async listRelays(): Promise<string[]> {
-    let stored: string[] = [];
+  private async storedRelays(): Promise<string[]> {
     try {
-      stored = JSON.parse(await readFile(this.relaysPath, "utf8")) as string[];
+      return (JSON.parse(await readFile(this.relaysPath, "utf8")) as string[]).map(normalizeRelay);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      return [];
     }
-    return [...new Set(stored.map(normalizeRelay))];
+  }
+
+  async listRelays(): Promise<string[]> {
+    return [...new Set([...this.defaultRelays, ...(await this.storedRelays())])];
   }
 
   async addRelay(value: string): Promise<string[]> {
     const relay = normalizeRelay(value);
-    const relays = [...new Set([...(await this.listRelays()), relay])];
+    const stored = [...new Set([...(await this.storedRelays()), relay])];
     await this.ensureDirectory();
-    await writeFile(this.relaysPath, `${JSON.stringify(relays, null, 2)}\n`, { mode: 0o600 });
-    return relays;
+    await writeFile(this.relaysPath, `${JSON.stringify(stored, null, 2)}\n`, { mode: 0o600 });
+    return this.listRelays();
   }
 
   private async secretKey(): Promise<Uint8Array> {

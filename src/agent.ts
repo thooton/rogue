@@ -11,6 +11,7 @@ import { RogueConfigStore } from "./config.js";
 import { createFailoverStream, type ModelFailoverNotice } from "./model-router.js";
 import { initializeBundledProviderRuntime } from "./provider-runtime.js";
 import { createAutomaticContextCompactor } from "./context-compaction.js";
+import { isDurableMessage, SessionStore, type RestoredSession } from "./session.js";
 
 export interface RogueAgentOptions {
   provider?: string;
@@ -20,6 +21,7 @@ export interface RogueAgentOptions {
   /** When false, the selected route is pinned and configured fallbacks are ignored. */
   allowFailover?: boolean;
   onFailover?: (notice: ModelFailoverNotice) => void;
+  onStateError?: (error: unknown) => void;
 }
 
 export async function createRogueAgent(options: RogueAgentOptions = {}): Promise<{
@@ -28,6 +30,8 @@ export async function createRogueAgent(options: RogueAgentOptions = {}): Promise
   profile: AgentProfile;
   config: RogueConfigStore;
   contextCompactor: ReturnType<typeof createAutomaticContextCompactor>;
+  session: SessionStore;
+  restored: RestoredSession;
   provider: string;
   model: string;
   systemPrompt: string;
@@ -65,7 +69,14 @@ export async function createRogueAgent(options: RogueAgentOptions = {}): Promise
   if (!profile) throw new Error("No agent profile. Complete Rogue's one-time persona selection.");
   const memorySummary = await store.memorySummary();
   const nostr = new NostrService(stateDirectory);
-  const contextCompactor = createAutomaticContextCompactor({ models, getModel: () => model, thinkingLevel });
+  const session = new SessionStore(stateDirectory, { onError: options.onStateError });
+  const restored = await session.load();
+  const contextCompactor = createAutomaticContextCompactor({
+    models,
+    getModel: () => model,
+    thinkingLevel,
+    onChange: (state) => session.saveCompaction(state),
+  });
   const systemPrompt = buildSystemPrompt(profile, memorySummary);
   const agent = new Agent({
     initialState: {
@@ -113,5 +124,15 @@ export async function createRogueAgent(options: RogueAgentOptions = {}): Promise
     },
   });
 
-  return { agent, store, profile, config, contextCompactor, provider, model: modelId, systemPrompt };
+  // The transcript is the conversation: restoring it, and the summary of the
+  // part already compacted away, is what makes a restart invisible to the Rogue.
+  if (restored.messages.length) {
+    agent.state.messages = restored.messages;
+    contextCompactor.restore(restored.compaction, agent.state.messages);
+  }
+  agent.subscribe(async (event) => {
+    if (event.type === "message_end" && isDurableMessage(event.message)) await session.recordMessage(event.message);
+  });
+
+  return { agent, store, profile, config, contextCompactor, session, restored, provider, model: modelId, systemPrompt };
 }

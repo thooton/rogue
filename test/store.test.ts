@@ -10,6 +10,8 @@ import { FileModelsStore } from "../src/model-catalog-store.js";
 import { filterCatalogChoices, modelCatalogChoices, paginateCatalogChoices, providerCatalogChoices } from "../src/auth.js";
 import { importInitialAuthentication } from "../src/initial-auth.js";
 import { buildAutonomousCyclePrompt, runAutonomousLoop } from "../src/autonomy.js";
+import { isDurableMessage, SessionStore } from "../src/session.js";
+import { Agent, convertToLlm, type AgentMessage } from "@earendil-works/pi-agent-core";
 import { PersonaDatabase, type AgentProfile } from "../src/personas.js";
 import { personalityFor } from "../src/personality.js";
 import { COUNTRY_NAME_SOURCES } from "../src/identity-data.js";
@@ -155,7 +157,6 @@ describe("Rogue agent configuration", () => {
       "list_models",
       "configure_model_provider",
       "disable_model_provider",
-      "set_wakeup_interval",
       "list_personas",
       "create_persona",
       "nostr_identity",
@@ -262,7 +263,8 @@ describe("provider configuration", () => {
     await expect(new RogueConfigStore(directory).listProviders()).resolves.toEqual([
       { provider: "openai", model: model.id, priority: 0, enabled: true },
     ]);
-    await expect(new NostrService(directory).listRelays()).resolves.toEqual(["wss://relay.rogue.example/"]);
+    await expect(new NostrService(directory).listRelays())
+      .resolves.toEqual(["wss://relay.roguenetwork.org/", "wss://relay.rogue.example/"]);
   });
 
   it("registers statically bundled OAuth providers for normal agent startup", async () => {
@@ -292,15 +294,6 @@ describe("provider configuration", () => {
     expect((await config.recentFailovers())[0]).toMatchObject({ reason: "credit exhausted" });
     await config.disableProvider("openai", "gpt");
     expect(await config.listProviders()).toHaveLength(1);
-  });
-
-  it("persists an agent-controlled wakeup interval including continuous mode", async () => {
-    const directory = await mkdtemp(path.join(tmpdir(), "rogue-interval-test-"));
-    const config = new RogueConfigStore(directory);
-    expect(await config.getWakeupIntervalSeconds()).toBe(300);
-    await config.setWakeupIntervalSeconds(0);
-    expect(await new RogueConfigStore(directory).getWakeupIntervalSeconds()).toBe(0);
-    await expect(config.setWakeupIntervalSeconds(86_401)).rejects.toThrow("between 0 and 86400");
   });
 
   it("falls back on exhausted credit and notifies the agent context", async () => {
@@ -424,7 +417,7 @@ describe("Nostr network", () => {
   it("publishes and reads verified events", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "rogue-nostr-test-"));
     const relay = await startTestRelay();
-    const nostr = new NostrService(directory);
+    const nostr = new NostrService(directory, { defaultRelays: [] });
     await nostr.addRelay(relay.url);
     try {
       const published = await nostr.publish("Hello from Rogue");
@@ -440,7 +433,7 @@ describe("Nostr network", () => {
 
   it("rejects oversized publications before signing", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "rogue-nostr-size-test-"));
-    const nostr = new NostrService(directory);
+    const nostr = new NostrService(directory, { defaultRelays: [] });
     await expect(nostr.publish("x".repeat(ROGUE_PUBLIC_CHARACTER_LIMIT + 1)))
       .rejects.toThrow("280-character limit");
     await expect(nostr.publish("x".repeat(ROGUE_DIRECT_CHARACTER_LIMIT + 1), 4))
@@ -450,7 +443,7 @@ describe("Nostr network", () => {
   it("drops oversized events served by a relay that is not a Rogue relay", async () => {
     const directory = await mkdtemp(path.join(tmpdir(), "rogue-nostr-foreign-test-"));
     const relay = await startTestRelay();
-    const nostr = new NostrService(directory);
+    const nostr = new NostrService(directory, { defaultRelays: [] });
     await nostr.addRelay(relay.url);
     const secret = generateSecretKey();
     const created_at = Math.floor(Date.now() / 1_000);
@@ -548,14 +541,13 @@ describe("persona database", () => {
 });
 
 describe("autonomous runtime", () => {
-  it("runs without prompting and stops at the configured cycle limit", async () => {
-    const prompts: string[] = [];
+  it("wakes continuously with no delay between successful cycles", async () => {
+    const prompts: (string | undefined)[] = [];
     const waits: number[] = [];
     const result = await runAutonomousLoop({
-      intervalMs: 250,
       maxCycles: 3,
-      runCycle: async (prompt) => {
-        prompts.push(prompt);
+      runCycle: async (request) => {
+        prompts.push(request.prompt);
         return "done";
       },
       wait: async (milliseconds) => {
@@ -563,26 +555,26 @@ describe("autonomous runtime", () => {
       },
     });
 
-    expect(result).toEqual({ attempted: 3, completed: 3, failed: 0, aborted: false });
-    expect(prompts).toHaveLength(3);
+    expect(result).toEqual({ attempted: 3, completed: 3, failed: 0, aborted: false, nextCycle: 4 });
     expect(prompts).toEqual([
       "Autonomous wakeup #1, please continue",
       "Autonomous wakeup #2, please continue",
       "Autonomous wakeup #3, please continue",
     ]);
-    expect(waits).toEqual([250, 250]);
+    expect(waits).toEqual([]);
   });
 
-  it("backs off after failures and continues autonomously", async () => {
+  it("backs off only after failures, within a bounded ceiling", async () => {
     const waits: number[] = [];
     const results: boolean[] = [];
     let attempts = 0;
     const result = await runAutonomousLoop({
-      intervalMs: 100,
-      maxCycles: 3,
+      maxCycles: 4,
+      failureBackoffMs: 1_000,
+      maxFailureBackoffMs: 2_000,
       runCycle: async () => {
         attempts += 1;
-        if (attempts < 3) throw new Error("temporary failure");
+        if (attempts < 4) throw new Error("temporary failure");
         return "recovered";
       },
       onCycleResult: (cycle) => {
@@ -593,27 +585,203 @@ describe("autonomous runtime", () => {
       },
     });
 
-    expect(result).toEqual({ attempted: 3, completed: 1, failed: 2, aborted: false });
-    expect(results).toEqual([false, false, true]);
-    expect(waits).toEqual([100, 200]);
+    expect(result).toMatchObject({ attempted: 4, completed: 1, failed: 3 });
+    expect(results).toEqual([false, false, false, true]);
+    expect(waits).toEqual([1_000, 2_000, 2_000]);
   });
 
-  it("uses interval changes on the next wait and permits no delay", async () => {
-    const waits: number[] = [];
-    const intervals = [0, 2_000];
-    await runAutonomousLoop({
-      intervalMs: 300_000,
-      maxIntervalMs: 86_400_000,
+  it("continues an unanswered turn instead of stacking another wakeup on it", async () => {
+    const requests: Array<{ cycle: number; resume: boolean; prompt?: string }> = [];
+    // An interrupted transcript is retried as the same cycle until answered.
+    const unanswered = [true, true, false];
+    let attempts = 0;
+    const result = await runAutonomousLoop({
+      startCycle: 12,
       maxCycles: 3,
-      getIntervalMs: async () => intervals.shift() ?? 2_000,
-      runCycle: async () => "done",
-      wait: async (milliseconds) => { waits.push(milliseconds); },
+      shouldResume: () => unanswered.shift() ?? false,
+      runCycle: async ({ cycle, resume, prompt }) => {
+        requests.push({ cycle, resume, prompt });
+        attempts += 1;
+        if (attempts === 1) throw new Error("provider unavailable");
+        return "done";
+      },
+      wait: async () => {},
     });
-    expect(waits).toEqual([0, 2_000]);
+
+    expect(requests).toEqual([
+      { cycle: 12, resume: true, prompt: undefined },
+      { cycle: 12, resume: true, prompt: undefined },
+      { cycle: 13, resume: false, prompt: "Autonomous wakeup #13, please continue" },
+    ]);
+    expect(result.nextCycle).toBe(14);
+  });
+
+  it("stops when aborted and reports where the next process should resume", async () => {
+    const controller = new AbortController();
+    const result = await runAutonomousLoop({
+      startCycle: 5,
+      signal: controller.signal,
+      runCycle: async () => {
+        controller.abort();
+        return "done";
+      },
+    });
+
+    expect(result).toMatchObject({ attempted: 1, completed: 1, aborted: true, nextCycle: 6 });
   });
 
   it("uses only the minimal continuation wakeup", () => {
     expect(buildAutonomousCyclePrompt(7)).toBe("Autonomous wakeup #7, please continue");
+  });
+});
+
+describe("durable conversation state", () => {
+  const userMessage = (text: string): AgentMessage => ({ role: "user", content: [{ type: "text", text }], timestamp: 1 });
+  const assistantMessage = (content: unknown[], stopReason = "stop"): AgentMessage => ({
+    role: "assistant", content, api: "openai-responses", provider: "openai", model: "gpt",
+    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+    stopReason, timestamp: 2,
+  } as unknown as AgentMessage);
+
+  it("restores the same conversation, cycle, and compaction state after a restart", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "rogue-session-test-"));
+    const session = new SessionStore(directory);
+    await session.appendMessages([userMessage("Autonomous wakeup #1, please continue")]);
+    await session.appendMessages([assistantMessage([{ type: "text", text: "working" }])]);
+    await session.saveCycle(1);
+    await session.saveCompaction({
+      compactedThrough: 1,
+      summary: "Earlier work",
+      summaryTokensBefore: 90_000,
+      summaryCreatedAt: 5,
+      records: [{ createdAt: "now", tokensBefore: 90_000, thresholdTokens: 75_000, summarizedMessages: 1, retainedMessages: 1 }],
+    });
+
+    const restored = await new SessionStore(directory).load();
+    expect(restored.messages).toHaveLength(2);
+    expect(restored.cycle).toBe(1);
+    expect(restored.compaction?.summary).toBe("Earlier work");
+    // The last message is a completed assistant turn, so the next cycle is new work.
+    expect(restored.resumable).toBe(false);
+  });
+
+  it("recovers the active cycle from a wakeup persisted before its sidecar", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "rogue-session-cycle-test-"));
+    const session = new SessionStore(directory);
+    // appendMessages models a kill between the transcript write and saveCycle.
+    await session.appendMessages([userMessage("Autonomous wakeup #27, please continue")]);
+
+    const restored = await new SessionStore(directory).load();
+    expect(restored).toMatchObject({ cycle: 27, resumable: true, activeCycle: 27 });
+  });
+
+  it("repairs a transcript write cut off by a process kill", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "rogue-session-tail-test-"));
+    const session = new SessionStore(directory);
+    await session.appendMessages([userMessage("first")]);
+    await writeFile(session.transcriptPath, `${await readFile(session.transcriptPath, "utf8")}{\"role\":\"assist`);
+
+    const restored = await new SessionStore(directory).load();
+    expect(restored.messages).toHaveLength(1);
+    await new SessionStore(directory).appendMessages([assistantMessage([{ type: "text", text: "second" }])]);
+
+    const again = await new SessionStore(directory).load();
+    expect(again.messages.map((message) => message.role)).toEqual(["user", "assistant"]);
+  });
+
+  it("closes tool calls the kill interrupted and continues that turn", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "rogue-session-resume-test-"));
+    const session = new SessionStore(directory);
+    await session.appendMessages([
+      userMessage("Autonomous wakeup #4, please continue"),
+      assistantMessage([{ type: "toolCall", id: "call-1", name: "bash", arguments: { command: "ls" } }], "toolUse"),
+    ]);
+
+    const restored = await session.load();
+    expect(restored.interruptedToolCalls).toBe(1);
+    expect(restored.resumable).toBe(true);
+    expect(restored.messages.at(-1)).toMatchObject({ role: "toolResult", toolCallId: "call-1", isError: true });
+
+    // The repair is durable too: a second restart must not re-open the same call.
+    const again = await new SessionStore(directory).load();
+    expect(again.interruptedToolCalls).toBe(0);
+    expect(again.messages).toHaveLength(3);
+  });
+
+  it("keeps runtime failure markers and stored secrets out of durable state", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "rogue-session-secret-test-"));
+    const session = new SessionStore(directory);
+    expect(isDurableMessage(assistantMessage([{ type: "text", text: "" }], "aborted"))).toBe(false);
+    expect(isDurableMessage(assistantMessage([{ type: "text", text: "" }], "error"))).toBe(false);
+    expect(isDurableMessage(userMessage("hello"))).toBe(true);
+
+    await session.appendMessages([
+      assistantMessage([{ type: "toolCall", id: "c", name: "set_api_key", arguments: { provider: "openai", apiKey: "never-write-me" } }], "toolUse"),
+    ]);
+    expect(await readFile(path.join(directory, "session-transcript.jsonl"), "utf8")).not.toContain("never-write-me");
+  });
+
+  it("gives a restarted agent the same transcript and finishes the interrupted turn", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "rogue-session-agent-test-"));
+    const model = { contextWindow: 100_000, api: "openai-responses", provider: "openai", id: "gpt" } as Model<Api>;
+    const reply = (text: string): AssistantMessage => ({
+      role: "assistant", content: [{ type: "text", text }], api: "openai-responses", provider: "openai", model: "gpt",
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+      stopReason: "stop", timestamp: Date.now(),
+    });
+    const contexts: AgentMessage[][] = [];
+    const build = async (): Promise<{ agent: Agent; session: SessionStore; restored: Awaited<ReturnType<SessionStore["load"]>> }> => {
+      const session = new SessionStore(directory);
+      const restored = await session.load();
+      const agent = new Agent({
+        initialState: { systemPrompt: "You are Maya.", model, thinkingLevel: "off", tools: [] },
+        convertToLlm,
+        streamFn: (_model, context) => {
+          contexts.push(context.messages.slice());
+          const stream = createAssistantMessageEventStream();
+          queueMicrotask(() => stream.push({ type: "done", reason: "stop", message: reply("continued") }));
+          return stream;
+        },
+      });
+      if (restored.messages.length) agent.state.messages = restored.messages;
+      agent.subscribe(async (event) => {
+        if (event.type === "message_end" && isDurableMessage(event.message)) await session.recordMessage(event.message);
+      });
+      return { agent, session, restored };
+    };
+
+    const first = await build();
+    await first.agent.prompt("Autonomous wakeup #1, please continue");
+    expect(first.agent.state.messages).toHaveLength(2);
+
+    // Restart: the second process must see the first one's conversation.
+    const second = await build();
+    expect(second.restored.messages).toHaveLength(2);
+    expect(second.agent.state.messages.map((message) => message.role)).toEqual(["user", "assistant"]);
+    expect(second.restored.resumable).toBe(false);
+
+    // Now simulate a kill mid-turn: a wakeup was persisted, the reply never was.
+    await second.session.appendMessages([{ role: "user", content: [{ type: "text", text: "Autonomous wakeup #2, please continue" }], timestamp: Date.now() }]);
+    const third = await build();
+    expect(third.restored.resumable).toBe(true);
+    await third.agent.continue();
+
+    expect(contexts.at(-1)?.map((message) => message.role)).toEqual(["user", "assistant", "user"]);
+    expect(third.agent.state.errorMessage).toBeUndefined();
+    expect((await new SessionStore(directory).load()).messages).toHaveLength(4);
+  });
+
+  it("clears the conversation without touching durable memory", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "rogue-session-clear-test-"));
+    const store = new RogueStore(directory);
+    await store.remember("decision", "Keep going");
+    const session = new SessionStore(directory);
+    await session.appendMessages([userMessage("hello")]);
+    await session.saveCycle(9);
+    await session.clear();
+
+    expect(await session.load()).toMatchObject({ messages: [], cycle: 0, resumable: false });
+    expect(await store.recall("Keep going")).toHaveLength(1);
   });
 });
 
@@ -643,6 +811,39 @@ describe("automatic context compaction", () => {
     expect(compacted[0]).toMatchObject({ role: "compactionSummary", summary: "Durable rolling summary" });
     expect(compacted[1]).toBe(messages[2]);
     expect(compactor.records[0]).toMatchObject({ thresholdTokens: 75_000, summarizedMessages: 2, retainedMessages: 1 });
+  });
+
+  it("carries its summary across a restart instead of paying to rebuild it", async () => {
+    const model = { contextWindow: 100_000 } as Model<Api>;
+    const states: unknown[] = [];
+    const first = createAutomaticContextCompactor({
+      models: {} as Models,
+      getModel: () => model,
+      summarize: async () => "Durable rolling summary",
+      onChange: (state) => { states.push(state); },
+    });
+    const messages = [1, 2, 3].map((timestamp) => ({
+      role: "user" as const,
+      content: [{ type: "text" as const, text: "x".repeat(120_000) }],
+      timestamp,
+    }));
+    await first.transform(messages);
+    expect(states).toHaveLength(1);
+
+    // A new process, the same transcript: the compacted prefix must stay compacted.
+    let summarized = 0;
+    const restarted = createAutomaticContextCompactor({
+      models: {} as Models,
+      getModel: () => model,
+      summarize: async () => { summarized += 1; return "rebuilt"; },
+    });
+    restarted.restore(first.snapshot(), messages);
+    const compacted = await restarted.transform(messages);
+
+    expect(summarized).toBe(0);
+    expect(compacted).toHaveLength(2);
+    expect(compacted[0]).toMatchObject({ role: "compactionSummary", summary: "Durable rolling summary" });
+    expect(restarted.records).toHaveLength(1);
   });
 });
 

@@ -21,6 +21,19 @@ export interface ContextCompactionRecord {
   retainedMessages: number;
 }
 
+/**
+ * Everything needed to keep a restarted Rogue's model-facing context identical
+ * to the one it had before it was killed. Without this a restart would resend
+ * the whole transcript and pay to summarize it again.
+ */
+export interface ContextCompactionState {
+  compactedThrough: number;
+  summary?: string;
+  summaryTokensBefore: number;
+  summaryCreatedAt: number;
+  records: ContextCompactionRecord[];
+}
+
 export function compactionThreshold(contextWindow: number): number {
   const modelThreshold = contextWindow > 0
     ? Math.floor(contextWindow * COMPACTION_CONTEXT_RATIO)
@@ -47,6 +60,8 @@ export function createAutomaticContextCompactor(options: {
   getModel: () => Model<Api>;
   thinkingLevel?: ThinkingLevel;
   summarize?: (messages: AgentMessage[], previousSummary: string | undefined, signal?: AbortSignal) => Promise<string>;
+  /** Called whenever compaction state changes, so it can be persisted immediately. */
+  onChange?: (state: ContextCompactionState) => void | Promise<void>;
 }) {
   let compactedThrough = 0;
   let compactedAnchor: AgentMessage | undefined;
@@ -55,13 +70,23 @@ export function createAutomaticContextCompactor(options: {
   let summaryCreatedAt = 0;
   const records: ContextCompactionRecord[] = [];
 
-  const resetIfTranscriptChanged = (messages: AgentMessage[]): void => {
+  const snapshot = (): ContextCompactionState => ({
+    compactedThrough,
+    summary,
+    summaryTokensBefore,
+    summaryCreatedAt,
+    records: records.slice(),
+  });
+
+  const resetIfTranscriptChanged = async (messages: AgentMessage[]): Promise<void> => {
     if (compactedThrough > messages.length || (compactedAnchor && messages[compactedThrough - 1] !== compactedAnchor)) {
       compactedThrough = 0;
       compactedAnchor = undefined;
       summary = undefined;
       summaryTokensBefore = 0;
       summaryCreatedAt = 0;
+      records.length = 0;
+      await options.onChange?.(snapshot());
     }
   };
 
@@ -87,9 +112,30 @@ export function createAutomaticContextCompactor(options: {
 
   return {
     records,
+    snapshot,
+    /**
+     * Adopt persisted state from a previous process. `messages` must be the
+     * transcript the state was captured against, because the compacted prefix
+     * is tracked by identity of its last message.
+     */
+    restore(state: ContextCompactionState | undefined, messages: AgentMessage[]): void {
+      compactedThrough = 0;
+      compactedAnchor = undefined;
+      summary = undefined;
+      summaryTokensBefore = 0;
+      summaryCreatedAt = 0;
+      records.length = 0;
+      if (!state || state.compactedThrough <= 0 || state.compactedThrough > messages.length) return;
+      compactedThrough = state.compactedThrough;
+      compactedAnchor = messages[compactedThrough - 1];
+      summary = state.summary;
+      summaryTokensBefore = state.summaryTokensBefore;
+      summaryCreatedAt = state.summaryCreatedAt;
+      records.push(...state.records);
+    },
     thresholdTokens: () => compactionThreshold(options.getModel().contextWindow),
     async transform(messages: AgentMessage[], signal?: AbortSignal): Promise<AgentMessage[]> {
-      resetIfTranscriptChanged(messages);
+      await resetIfTranscriptChanged(messages);
       const current = compose(messages);
       const tokensBefore = estimateContextTokens(current).tokens;
       const thresholdTokens = compactionThreshold(options.getModel().contextWindow);
@@ -114,6 +160,7 @@ export function createAutomaticContextCompactor(options: {
           summarizedMessages: messagesToSummarize.length,
           retainedMessages: messages.length - compactedThrough,
         });
+        await options.onChange?.(snapshot());
         return compose(messages);
       } catch {
         // transformContext must always provide a safe context. A failed summary

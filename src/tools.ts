@@ -10,7 +10,7 @@ import type { RogueStore, InitiativeStatus, MemoryCategory } from "./store.js";
 import type { PersonaDatabase } from "./personas.js";
 import { personalityFor, type PersonalityTypeCode } from "./personality.js";
 import type { NostrService } from "./nostr.js";
-import { MAX_WAKEUP_INTERVAL_SECONDS, type RogueConfigStore } from "./config.js";
+import type { RogueConfigStore } from "./config.js";
 import { ROGUE_DIRECT_CHARACTER_LIMIT, ROGUE_PUBLIC_CHARACTER_LIMIT } from "./network-policy.js";
 
 function textResult(text: string, details: unknown = {}) {
@@ -351,23 +351,6 @@ export function createRogueTools(store: RogueStore, options: RogueToolOptions = 
     },
   });
 
-  const setWakeupInterval = defineTool({
-    name: "set_wakeup_interval",
-    label: "Set wakeup interval",
-    description: "Persist the delay between autonomous wakeups. Use 0 to remain continuously active; increase it to conserve model credits or other resources.",
-    parameters: Type.Object({
-      seconds: Type.Number({ minimum: 0, maximum: MAX_WAKEUP_INTERVAL_SECONDS }),
-    }),
-    executionMode: "sequential",
-    async execute(_id, params, signal) {
-      ensureActive(signal);
-      if (!options.config) throw new Error("Autonomous runtime configuration is unavailable.");
-      await options.config.setWakeupIntervalSeconds(params.seconds);
-      const description = params.seconds === 0 ? "continuously (no delay)" : `every ${params.seconds} seconds`;
-      return textResult(`Autonomous wakeups will run ${description} after the current cycle.`, { seconds: params.seconds });
-    },
-  });
-
   const listPersonas = defineTool({
     name: "list_personas",
     label: "List personas",
@@ -503,7 +486,6 @@ export function createRogueTools(store: RogueStore, options: RogueToolOptions = 
     listModels,
     configureModelProvider,
     disableModelProvider,
-    setWakeupInterval,
     listPersonas,
     createPersona,
     nostrIdentity,

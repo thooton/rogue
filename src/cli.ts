@@ -10,10 +10,12 @@ import { NostrService } from "./nostr.js";
 import {
   buildAutonomousCyclePrompt,
   runAutonomousLoop,
+  type AutonomousCycleRequest,
   type AutonomousCycleResult,
 } from "./autonomy.js";
+import { isDurableMessage, SessionStore } from "./session.js";
 import { verifyBundledProviderRuntime } from "./provider-runtime.js";
-import { MAX_WAKEUP_INTERVAL_SECONDS, RogueConfigStore } from "./config.js";
+import { RogueConfigStore } from "./config.js";
 import { importInitialAuthentication } from "./initial-auth.js";
 import * as ui from "./ui.js";
 
@@ -24,7 +26,6 @@ interface CliOptions {
   thinkingLevel?: ThinkingLevel;
   prompt?: string;
   interactive: boolean;
-  intervalSeconds?: number;
   maxCycles?: number;
   autoSelectPersona: boolean;
   authenticate: boolean;
@@ -33,11 +34,18 @@ interface CliOptions {
   inspectHost: string;
   nostrRelays: string[];
   allowFailover: boolean;
+  freshSession: boolean;
   help: boolean;
   selfCheck: boolean;
 }
 
 const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+
+// The viewer is a live window onto an agent that may have been running for
+// months; the complete history lives in the durable transcript instead of being
+// re-serialized on every poll.
+const VIEWER_MESSAGE_WINDOW = 400;
+const VIEWER_EVENT_WINDOW = 400;
 
 function usage(): string {
   return `Rogue — autonomous, database-defined agents powered by Pi
@@ -52,8 +60,8 @@ Options:
   --state-dir <path> Durable state directory (default: .rogue)
   --thinking <level> off|minimal|low|medium|high|xhigh|max
   --interactive      Start the supervised chat interface
-  --interval <sec>   Persist wakeup delay, 0-${MAX_WAKEUP_INTERVAL_SECONDS}s (initial default: 300)
-  --max-cycles <n>   Stop after n attempted cycles (default: unlimited)
+  --max-cycles <n>   Stop after n attempted cycles (default: run forever)
+  --fresh-session    Discard the persisted conversation and start a new one
   --auto-select      Select the first generated persona without prompting
   --auth [provider]  Browse providers, authenticate, choose models, and exit
   --api-key <id>     Run a provider's API credential setup and choose a model
@@ -63,9 +71,10 @@ Options:
   --self-check       Verify bundled provider modules without network access
   -h, --help         Show this help
 
-Without a prompt, Rogue runs autonomously until stopped. A positional prompt runs
-once and exits. Credentials and fallback routes are loaded from Rogue's private
-state directory.`;
+Without a prompt, Rogue runs autonomously and continuously until stopped. A
+positional prompt runs once and exits. Credentials, fallback routes, and the
+conversation itself are loaded from Rogue's private state directory, so a
+restarted Rogue resumes exactly where it was interrupted.`;
 }
 
 function takeValue(args: string[], index: number, flag: string): string {
@@ -84,6 +93,7 @@ export function parseArgs(args: string[]): CliOptions {
     inspectHost: "127.0.0.1",
     nostrRelays: [],
     allowFailover: true,
+    freshSession: false,
   };
   const prompt: string[] = [];
   for (let index = 0; index < args.length; index += 1) {
@@ -104,11 +114,8 @@ export function parseArgs(args: string[]): CliOptions {
     } else if (arg === "--inspect-host") options.inspectHost = takeValue(args, index++, arg);
     else if (arg === "--nostr-relay") options.nostrRelays.push(takeValue(args, index++, arg));
     else if (arg === "--no-failover") options.allowFailover = false;
-    else if (arg === "--interval") {
-      const value = Number(takeValue(args, index++, arg));
-      if (!Number.isFinite(value) || value < 0 || value > MAX_WAKEUP_INTERVAL_SECONDS) throw new Error(`Invalid interval: ${value}`);
-      options.intervalSeconds = value;
-    } else if (arg === "--max-cycles") {
+    else if (arg === "--fresh-session") options.freshSession = true;
+    else if (arg === "--max-cycles") {
       const value = Number(takeValue(args, index++, arg));
       if (!Number.isSafeInteger(value) || value < 1) throw new Error(`Invalid max cycles: ${value}`);
       options.maxCycles = value;
@@ -196,12 +203,10 @@ async function configureInitialRelays(options: CliOptions): Promise<void> {
   const nostr = new NostrService(options.stateDirectory ?? ".rogue");
   let relays = await nostr.listRelays();
   ui.steps(SETUP_STEPS, 2);
-  ui.heading("Rogue Network", "Add ws:// or wss:// relay URLs, or press Enter to skip.");
-  if (relays.length) {
-    ui.hint(`Already configured (${relays.length}):`);
-    ui.chips(relays);
-    ui.write();
-  }
+  ui.heading("Rogue Network", "The public Rogue Network relay is included by default. Add more ws:// or wss:// relay URLs, or press Enter to skip.");
+  ui.hint(`Already configured (${relays.length}):`);
+  ui.chips(relays);
+  ui.write();
   while (true) {
     const answer = await ui.text({ label: "Relay URL", placeholder: "(Enter to finish)", allowEmpty: true });
     if (!answer) break;
@@ -212,12 +217,8 @@ async function configureInitialRelays(options: CliOptions): Promise<void> {
       ui.fail(error instanceof Error ? error.message : String(error));
     }
   }
-  if (relays.length) {
-    ui.write();
-    ui.chips(relays);
-  } else {
-    ui.hint("No relays configured. The agent can add them later with its Nostr tools.");
-  }
+  ui.write();
+  ui.chips(relays);
   ui.write();
 }
 
@@ -266,30 +267,43 @@ async function main(): Promise<void> {
   const firstRun = await ensureActiveProfile(options);
   await ensureModelProvider(options, firstRun);
   if (firstRun) await configureInitialRelays(options);
+  if (options.freshSession) await new SessionStore(options.stateDirectory ?? ".rogue").clear();
   const transcriptEvents: unknown[] = [];
-  const transcriptMessages: unknown[] = [];
-  const { agent, store, profile, config, contextCompactor, provider, model, systemPrompt } = await createRogueAgent({
-    ...options,
-    onFailover(notice) {
-      // A silent switch makes the next error look like it came from the
-      // provider the operator selected, so announce every route change.
-      transcriptEvents.push({ type: "model_failover", ...notice, timestamp: Date.now() });
-      process.stderr.write(`\n  ${ui.style.warning("⚠")} ${notice.from} unavailable (${notice.reason}) — falling back to ${ui.style.bold(notice.to)}\n`);
-    },
-  });
+  const recordEvent = (event: unknown): void => {
+    transcriptEvents.push(event);
+    if (transcriptEvents.length > VIEWER_EVENT_WINDOW) {
+      transcriptEvents.splice(0, transcriptEvents.length - VIEWER_EVENT_WINDOW);
+    }
+  };
+  const { agent, store, profile, config, contextCompactor, session, restored, provider, model, systemPrompt } =
+    await createRogueAgent({
+      ...options,
+      onStateError(error) {
+        // Durable state is what makes a restart safe, so a failure to write it
+        // is reported rather than swallowed, even though the cycle continues.
+        const message = error instanceof Error ? error.message : String(error);
+        process.stderr.write(`\n  ${ui.style.warning("⚠")} could not persist conversation state: ${message}\n`);
+      },
+      onFailover(notice) {
+        // A silent switch makes the next error look like it came from the
+        // provider the operator selected, so announce every route change.
+        recordEvent({ type: "model_failover", ...notice, timestamp: Date.now() });
+        process.stderr.write(`\n  ${ui.style.warning("⚠")} ${notice.from} unavailable (${notice.reason}) — falling back to ${ui.style.bold(notice.to)}\n`);
+      },
+    });
   let wroteText = false;
   let responseText = "";
   let running = false;
   let liveMessage: unknown;
   agent.subscribe((event) => {
-    transcriptEvents.push(event);
+    // A Rogue is expected to run for months, so only turn-level events are kept
+    // in memory, and only the most recent ones. The durable transcript is the
+    // record; this stream is a live debugging view.
+    if (event.type !== "message_update" && event.type !== "tool_execution_update") recordEvent(event);
     if (event.type === "agent_start") running = true;
     if (event.type === "agent_end") running = false;
     if (event.type === "message_update") liveMessage = event.message;
-    if (event.type === "message_end") {
-      transcriptMessages.push(event.message);
-      liveMessage = undefined;
-    }
+    if (event.type === "message_end") liveMessage = undefined;
     if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
       stdout.write(event.assistantMessageEvent.delta);
       responseText += event.assistantMessageEvent.delta;
@@ -302,25 +316,54 @@ async function main(): Promise<void> {
   const introspection = await startIntrospectionServer({
     profile,
     host: options.inspectHost,
-    getSnapshot: () => ({
-      systemPrompt,
-      messages: liveMessage ? [...transcriptMessages, liveMessage] : transcriptMessages,
-      events: transcriptEvents,
-      error: agent.state.errorMessage,
-      running,
-      route: `${provider}/${model}`,
-      compactions: contextCompactor.records,
-    }),
+    getSnapshot: () => {
+      const history = agent.state.messages;
+      const shown = history.slice(-VIEWER_MESSAGE_WINDOW);
+      return {
+        systemPrompt,
+        messages: liveMessage ? [...shown, liveMessage] : shown,
+        earlierMessages: history.length - shown.length,
+        events: transcriptEvents,
+        error: agent.state.errorMessage,
+        running,
+        route: `${provider}/${model}`,
+        compactions: contextCompactor.records,
+      };
+    },
   });
   process.stderr.write(`  ${ui.style.info("◎")} ${ui.style.faint("Read-only transcript")} ${ui.style.underline(introspection.url)}\n`);
 
-  const runPrompt = async (input: string): Promise<string> => {
+  // A failed or aborted run appends a runtime error marker to the transcript.
+  // Durable state never records one, so it is dropped here as well: the live
+  // conversation stays byte-identical to the one a restart would reload, and
+  // the unanswered turn is retried instead of being buried under a new wakeup.
+  const dropFailureMarkers = (): void => {
+    const messages = agent.state.messages;
+    let end = messages.length;
+    while (end > 0 && !isDurableMessage(messages[end - 1]!)) end -= 1;
+    if (end !== messages.length) agent.state.messages = messages.slice(0, end);
+  };
+  const runTurn = async (start: () => Promise<void>): Promise<string> => {
     wroteText = false;
     responseText = "";
-    await agent.prompt(input);
-    if (wroteText) stdout.write("\n");
+    let thrown: unknown;
+    try {
+      await start();
+    } catch (error) {
+      thrown = error;
+    } finally {
+      if (wroteText) stdout.write("\n");
+      dropFailureMarkers();
+    }
     if (agent.state.errorMessage) throw new Error(agent.state.errorMessage);
+    if (thrown !== undefined) throw thrown;
     return responseText.trim();
+  };
+  const runPrompt = (input: string): Promise<string> => runTurn(() => agent.prompt(input));
+  /** True when the transcript ends in a turn the model has not answered yet. */
+  const hasUnansweredTurn = (): boolean => {
+    const last = agent.state.messages.at(-1);
+    return last !== undefined && last.role !== "assistant";
   };
 
   const controller = new AbortController();
@@ -355,6 +398,8 @@ async function main(): Promise<void> {
           }
           if (input === ":reset") {
             agent.reset();
+            contextCompactor.restore(undefined, []);
+            await session.clear();
             ui.success("Conversation cleared. Durable memory remains.");
             continue;
           }
@@ -372,21 +417,25 @@ async function main(): Promise<void> {
         .map((route) => `${route.provider}/${route.model}`)
         .filter((route) => route !== `${provider}/${model}`)
       : [];
-    if (options.intervalSeconds !== undefined) await config.setWakeupIntervalSeconds(options.intervalSeconds);
-    const wakeupIntervalSeconds = await config.getWakeupIntervalSeconds();
+    // An interrupted turn is finished before anything new is asked of the
+    // agent, so a restart continues the thought it was in the middle of.
+    const startCycle = restored.activeCycle ?? Math.max(1, restored.cycle + 1);
     ui.panel("Autonomous session", [
       ["Agent", identity],
       ["Route", `${provider}${ui.style.faint("/")}${model}`],
       ["Fallbacks", fallbackRoutes.length
         ? fallbackRoutes.join(ui.style.faint(" → "))
         : ui.style.faint(options.allowFailover ? "none configured" : "disabled (--no-failover)")],
-      ["Cadence", `${wakeupIntervalSeconds}s between wakeups${options.maxCycles ? ` · max ${options.maxCycles} cycles` : ""}`],
+      ["Cadence", `continuous · no delay between wakeups${options.maxCycles ? ` · max ${options.maxCycles} cycles` : ""}`],
+      ["Session", restored.messages.length
+        ? `${restored.messages.length} restored messages · ${restored.resumable ? `resuming cycle ${startCycle}` : `next cycle ${startCycle}`}${restored.interruptedToolCalls ? ` · ${restored.interruptedToolCalls} interrupted tool call${restored.interruptedToolCalls === 1 ? "" : "s"} closed` : ""}`
+        : ui.style.faint("new conversation")],
     ]);
 
     const recordResult = async (result: AutonomousCycleResult): Promise<void> => {
       await store.recordAutonomyCycle({
         cycle: result.cycle,
-        prompt: buildAutonomousCyclePrompt(result.cycle),
+        prompt: result.resumed ? `Resumed interrupted cycle #${result.cycle}` : buildAutonomousCyclePrompt(result.cycle),
         ok: result.ok,
         output: result.output,
         error: result.error,
@@ -395,17 +444,17 @@ async function main(): Promise<void> {
     };
 
     const result = await runAutonomousLoop({
-      intervalMs: wakeupIntervalSeconds * 1000,
-      maxIntervalMs: MAX_WAKEUP_INTERVAL_SECONDS * 1000,
-      getIntervalMs: async () => (await config.getWakeupIntervalSeconds()) * 1000,
+      startCycle,
+      shouldResume: hasUnansweredTurn,
       maxCycles: options.maxCycles,
       signal: controller.signal,
-      onCycleStart(cycle) {
-        process.stderr.write(`\n  ${ui.style.accent("◆")} ${ui.style.faint(`autonomous cycle ${cycle}`)}\n`);
+      async onCycleStart(request: AutonomousCycleRequest) {
+        const label = request.resume ? `resuming autonomous cycle ${request.cycle}` : `autonomous cycle ${request.cycle}`;
+        process.stderr.write(`\n  ${ui.style.accent("◆")} ${ui.style.faint(label)}\n`);
       },
       onCycleResult: recordResult,
-      async runCycle(prompt, cycle) {
-        return runPrompt(prompt);
+      async runCycle(request: AutonomousCycleRequest) {
+        return request.resume ? runTurn(() => agent.continue()) : runPrompt(request.prompt!);
       },
     });
     ui.write();
@@ -414,6 +463,7 @@ async function main(): Promise<void> {
   } finally {
     process.off("SIGINT", abort);
     process.off("SIGTERM", abort);
+    await session.flush();
     await introspection.close();
   }
 }

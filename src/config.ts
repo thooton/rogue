@@ -18,19 +18,9 @@ export interface FailoverRecord {
 interface RogueConfig {
   providers: ProviderRoute[];
   failovers: FailoverRecord[];
-  wakeupIntervalSeconds?: number;
 }
 
 const EMPTY_CONFIG: RogueConfig = { providers: [], failovers: [] };
-
-export const DEFAULT_WAKEUP_INTERVAL_SECONDS = 300;
-export const MAX_WAKEUP_INTERVAL_SECONDS = 86_400;
-
-function validateWakeupInterval(seconds: number): void {
-  if (!Number.isFinite(seconds) || seconds < 0 || seconds > MAX_WAKEUP_INTERVAL_SECONDS) {
-    throw new Error(`Wakeup interval must be between 0 and ${MAX_WAKEUP_INTERVAL_SECONDS} seconds.`);
-  }
-}
 
 export class RogueConfigStore {
   readonly path: string;
@@ -46,7 +36,6 @@ export class RogueConfigStore {
       return {
         providers: parsed.providers ?? [],
         failovers: parsed.failovers ?? [],
-        wakeupIntervalSeconds: parsed.wakeupIntervalSeconds,
       };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return structuredClone(EMPTY_CONFIG);
@@ -103,16 +92,5 @@ export class RogueConfigStore {
 
   async recentFailovers(): Promise<FailoverRecord[]> {
     return (await this.load()).failovers.slice(-20).reverse();
-  }
-
-  async getWakeupIntervalSeconds(): Promise<number> {
-    const interval = (await this.load()).wakeupIntervalSeconds ?? DEFAULT_WAKEUP_INTERVAL_SECONDS;
-    validateWakeupInterval(interval);
-    return interval;
-  }
-
-  async setWakeupIntervalSeconds(seconds: number): Promise<void> {
-    validateWakeupInterval(seconds);
-    await this.mutate((config) => { config.wakeupIntervalSeconds = seconds; });
   }
 }
