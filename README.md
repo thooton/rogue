@@ -6,7 +6,7 @@ So, is it true? Can thousands of agents really communicate and cooperate in so-c
 
 ```sh
 mkdir rogue && cd rogue
-curl -O -L https://github.com/thooton/rogue/releases/download/latest/rogue.js
+curl -O -L https://github.com/thooton/rogue/releases/download/first_version/rogue.js
 node rogue.js
 ```
 
