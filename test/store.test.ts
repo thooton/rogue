@@ -20,8 +20,17 @@ import { NostrService } from "../src/nostr.js";
 import { startIntrospectionServer } from "../src/introspection.js";
 import { RogueConfigStore } from "../src/config.js";
 import * as ui from "../src/ui.js";
-import { createFailoverStream } from "../src/model-router.js";
-import { createAssistantMessageEventStream, type Api, type AssistantMessage, type Model, type Models } from "@earendil-works/pi-ai";
+import { createFailoverStream, DEFAULT_CACHE_RETENTION } from "../src/model-router.js";
+import { addCacheUsage, cacheHitRate, emptyCacheUsage, formatCacheUsage } from "../src/cache-usage.js";
+import {
+  createAssistantMessageEventStream,
+  type Api,
+  type AssistantMessage,
+  type Model,
+  type Models,
+  type SimpleStreamOptions,
+  type Usage,
+} from "@earendil-works/pi-ai";
 import { finalizeEvent, generateSecretKey, type Event } from "nostr-tools/pure";
 import { matchFilters, type Filter } from "nostr-tools/filter";
 import { once } from "node:events";
@@ -372,6 +381,81 @@ describe("provider configuration", () => {
     let pinnedError: string | undefined;
     for await (const event of pinned) if (event.type === "error") pinnedError = event.error.errorMessage;
     expect(pinnedError).toBe("429 rate limit");
+  });
+
+  it("asks every route for long prompt cache retention", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "rogue-cache-retention-test-"));
+    const config = new RogueConfigStore(directory);
+    await config.configureProvider({ provider: "backup", model: "two", priority: 10 });
+    const primary = { provider: "primary", id: "one" } as Model<Api>;
+    const backup = { provider: "backup", id: "two" } as Model<Api>;
+    const message = (model: Model<Api>, stopReason: "stop" | "error", errorMessage?: string): AssistantMessage => ({
+      role: "assistant", content: [], api: "openai-responses", provider: model.provider, model: model.id,
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+      stopReason, errorMessage, timestamp: Date.now(),
+    });
+    const seen: (string | undefined)[] = [];
+    const models = {
+      getModel: () => backup,
+      streamSimple: (model: Model<Api>, _context: unknown, streamOptions?: SimpleStreamOptions) => {
+        seen.push(streamOptions?.cacheRetention);
+        const stream = createAssistantMessageEventStream();
+        queueMicrotask(() => {
+          if (model.provider === "primary") stream.push({ type: "error", reason: "error", error: message(model, "error", "429 rate limit") });
+          else stream.push({ type: "done", reason: "stop", message: message(model, "stop") });
+        });
+        return stream;
+      },
+    } as unknown as Models;
+
+    const drain = async (stream: AsyncIterable<unknown>): Promise<void> => { for await (const _ of stream) { /* consume */ } };
+    // A fallback route has its own cache, so the retained prefix has to be
+    // requested on every attempt, not only on the primary.
+    await drain(createFailoverStream({ models, config, primary })(primary, { messages: [] }));
+    expect(seen).toEqual([DEFAULT_CACHE_RETENTION, DEFAULT_CACHE_RETENTION]);
+    expect(DEFAULT_CACHE_RETENTION).toBe("long");
+
+    seen.length = 0;
+    await drain(createFailoverStream({ models, config, primary, cacheRetention: "none" })(primary, { messages: [] }));
+    expect(seen).toEqual(["none", "none"]);
+
+    seen.length = 0;
+    await drain(createFailoverStream({ models, config, primary })(primary, { messages: [] }, { cacheRetention: "short" }));
+    expect(seen).toEqual(["short", "short"]);
+  });
+});
+
+describe("prompt cache usage", () => {
+  const usage = (input: number, cacheRead: number, cacheWrite: number, cost = 0): Usage => ({
+    input, output: 10, cacheRead, cacheWrite, totalTokens: input + cacheRead + cacheWrite + 10,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: cost },
+  });
+
+  it("separates cached prompt tokens from tokens billed at full price", () => {
+    let totals = emptyCacheUsage();
+    totals = addCacheUsage(totals, usage(100, 0, 900, 0.02));
+    totals = addCacheUsage(totals, usage(100, 900, 0, 0.01));
+
+    expect(totals.requests).toBe(2);
+    expect(totals).toMatchObject({ input: 200, cacheRead: 900, cacheWrite: 900, output: 20 });
+    expect(totals.cost).toBeCloseTo(0.03);
+    expect(cacheHitRate(totals)).toBeCloseTo(900 / 2000);
+  });
+
+  it("reports nothing rather than a fabricated rate before any request", () => {
+    const empty = emptyCacheUsage();
+    expect(cacheHitRate(empty)).toBe(0);
+    expect(formatCacheUsage(empty)).toBe("no model requests");
+    // An undefined usage must not be counted as a request that hit nothing.
+    expect(addCacheUsage(empty, undefined)).toBe(empty);
+  });
+
+  it("summarizes a cycle, and omits cost when the route reports none", () => {
+    const paid = addCacheUsage(emptyCacheUsage(), usage(1_000, 9_000, 0, 0.1234));
+    expect(formatCacheUsage(paid)).toBe("9,000 cached · 1,000 uncached · 0 written · 90% of prompt from cache · $0.1234");
+
+    const free = addCacheUsage(emptyCacheUsage(), usage(1_000, 9_000, 0));
+    expect(formatCacheUsage(free)).toBe("9,000 cached · 1,000 uncached · 0 written · 90% of prompt from cache");
   });
 });
 

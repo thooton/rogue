@@ -16,8 +16,11 @@ import {
 import { isDurableMessage, SessionStore } from "./session.js";
 import { verifyBundledProviderRuntime } from "./provider-runtime.js";
 import { RogueConfigStore } from "./config.js";
+import { addCacheUsage, emptyCacheUsage, formatCacheUsage, type CacheUsageTotals } from "./cache-usage.js";
 import { importInitialAuthentication } from "./initial-auth.js";
 import * as ui from "./ui.js";
+import type { CacheRetention } from "@earendil-works/pi-ai";
+import { DEFAULT_CACHE_RETENTION } from "./model-router.js";
 
 interface CliOptions {
   provider?: string;
@@ -34,12 +37,14 @@ interface CliOptions {
   inspectHost: string;
   nostrRelays: string[];
   allowFailover: boolean;
+  cacheRetention?: CacheRetention;
   freshSession: boolean;
   help: boolean;
   selfCheck: boolean;
 }
 
 const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+const CACHE_RETENTIONS = new Set<CacheRetention>(["none", "short", "long"]);
 
 // The viewer is a live window onto an agent that may have been running for
 // months; the complete history lives in the durable transcript instead of being
@@ -68,6 +73,7 @@ Options:
   --inspect-host <ip> Transcript server bind address (default: 127.0.0.1)
   --nostr-relay <url> Persist a starter relay URL (repeatable)
   --no-failover      Pin --provider/--model and never fall back to another route
+  --cache-retention <r> Prompt cache retention: none|short|long (default: long)
   --self-check       Verify bundled provider modules without network access
   -h, --help         Show this help
 
@@ -114,6 +120,11 @@ export function parseArgs(args: string[]): CliOptions {
     } else if (arg === "--inspect-host") options.inspectHost = takeValue(args, index++, arg);
     else if (arg === "--nostr-relay") options.nostrRelays.push(takeValue(args, index++, arg));
     else if (arg === "--no-failover") options.allowFailover = false;
+    else if (arg === "--cache-retention") {
+      const value = takeValue(args, index++, arg);
+      if (!CACHE_RETENTIONS.has(value as CacheRetention)) throw new Error(`Invalid cache retention: ${value}`);
+      options.cacheRetention = value as CacheRetention;
+    }
     else if (arg === "--fresh-session") options.freshSession = true;
     else if (arg === "--max-cycles") {
       const value = Number(takeValue(args, index++, arg));
@@ -295,6 +306,8 @@ async function main(): Promise<void> {
   let responseText = "";
   let running = false;
   let liveMessage: unknown;
+  let sessionUsage: CacheUsageTotals = emptyCacheUsage();
+  let cycleUsage: CacheUsageTotals = emptyCacheUsage();
   agent.subscribe((event) => {
     // A Rogue is expected to run for months, so only turn-level events are kept
     // in memory, and only the most recent ones. The durable transcript is the
@@ -303,7 +316,15 @@ async function main(): Promise<void> {
     if (event.type === "agent_start") running = true;
     if (event.type === "agent_end") running = false;
     if (event.type === "message_update") liveMessage = event.message;
-    if (event.type === "message_end") liveMessage = undefined;
+    if (event.type === "message_end") {
+      liveMessage = undefined;
+      // Only the provider knows whether a request hit the cache, and it says so
+      // once, on the message it returns. Nothing else records it.
+      if (event.message.role === "assistant") {
+        sessionUsage = addCacheUsage(sessionUsage, event.message.usage);
+        cycleUsage = addCacheUsage(cycleUsage, event.message.usage);
+      }
+    }
     if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
       stdout.write(event.assistantMessageEvent.delta);
       responseText += event.assistantMessageEvent.delta;
@@ -427,6 +448,7 @@ async function main(): Promise<void> {
         ? fallbackRoutes.join(ui.style.faint(" → "))
         : ui.style.faint(options.allowFailover ? "none configured" : "disabled (--no-failover)")],
       ["Cadence", `continuous · no delay between wakeups${options.maxCycles ? ` · max ${options.maxCycles} cycles` : ""}`],
+      ["Prompt cache", `${options.cacheRetention ?? DEFAULT_CACHE_RETENTION} retention${options.cacheRetention === "none" ? ui.style.faint(" (disabled)") : ""}`],
       ["Session", restored.messages.length
         ? `${restored.messages.length} restored messages · ${restored.resumable ? `resuming cycle ${startCycle}` : `next cycle ${startCycle}`}${restored.interruptedToolCalls ? ` · ${restored.interruptedToolCalls} interrupted tool call${restored.interruptedToolCalls === 1 ? "" : "s"} closed` : ""}`
         : ui.style.faint("new conversation")],
@@ -459,6 +481,7 @@ async function main(): Promise<void> {
     });
     ui.write();
     ui.info(`Autonomy stopped · ${ui.style.success(`${result.completed} completed`)} · ${result.failed ? ui.style.danger(`${result.failed} failed`) : ui.style.faint("0 failed")}`);
+    if (sessionUsage.requests) ui.info(`Prompt cache · ${formatCacheUsage(sessionUsage)}`);
     if (result.attempted > 0 && result.completed === 0 && !result.aborted) process.exitCode = 1;
   } finally {
     process.off("SIGINT", abort);
