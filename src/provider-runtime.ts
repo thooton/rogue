@@ -2,7 +2,11 @@ import { registerBunOAuthFlows } from "@earendil-works/pi-ai/bun-oauth";
 import * as bedrockProviderModule from "@earendil-works/pi-ai/api/bedrock-converse-stream";
 import { setBedrockProviderModule } from "@earendil-works/pi-ai/api/bedrock-converse-stream.lazy";
 import { builtinModels } from "@earendil-works/pi-ai/providers/all";
+import type { MutableModels } from "@earendil-works/pi-ai";
 import { createCodingTools, createFindTool, createGrepTool, createLsTool } from "@earendil-works/pi-coding-agent";
+import { FileCredentialStore } from "./credentials.js";
+import { FileModelsStore } from "./model-catalog-store.js";
+import { CustomProviderStore, registerCustomProviders } from "./custom-providers.js";
 
 let initialized = false;
 
@@ -12,6 +16,29 @@ export function initializeBundledProviderRuntime(): void {
   registerBunOAuthFlows();
   setBedrockProviderModule(bedrockProviderModule);
   initialized = true;
+}
+
+export interface RogueModelRuntime {
+  models: MutableModels;
+  credentials: FileCredentialStore;
+  modelsStore: FileModelsStore;
+  customProviders: CustomProviderStore;
+}
+
+/**
+ * The one place that assembles Rogue's model runtime: Pi's built-in providers
+ * plus every endpoint this installation has been pointed at itself. First-run
+ * setup, bootstrap import, and the agent loop all build it here, so a route
+ * naming a local or otherwise custom server resolves the same way in each.
+ */
+export async function createRogueModels(stateDirectory: string): Promise<RogueModelRuntime> {
+  initializeBundledProviderRuntime();
+  const credentials = new FileCredentialStore(`${stateDirectory}/auth.json`);
+  const modelsStore = new FileModelsStore(`${stateDirectory}/model-catalogs.json`);
+  const models = builtinModels({ credentials, modelsStore });
+  const customProviders = new CustomProviderStore(stateDirectory);
+  await registerCustomProviders(models, customProviders);
+  return { models, credentials, modelsStore, customProviders };
 }
 
 export async function verifyBundledProviderRuntime(): Promise<{

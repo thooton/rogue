@@ -6,13 +6,21 @@ import type {
   Api,
   Model,
   Models,
+  MutableModels,
   Provider,
 } from "@earendil-works/pi-ai";
-import { builtinModels } from "@earendil-works/pi-ai/providers/all";
-import { FileCredentialStore } from "./credentials.js";
-import { FileModelsStore } from "./model-catalog-store.js";
 import { RogueConfigStore } from "./config.js";
-import { initializeBundledProviderRuntime } from "./provider-runtime.js";
+import { createRogueModels } from "./provider-runtime.js";
+import {
+  CUSTOM_PROVIDER_APIS,
+  DEFAULT_CUSTOM_CONTEXT_WINDOW,
+  normalizeCustomBaseUrl,
+  saveCustomProvider,
+  suggestCustomProviderId,
+  type CustomProviderApi,
+  type CustomProviderDefinition,
+  type CustomProviderStore,
+} from "./custom-providers.js";
 import * as ui from "./ui.js";
 
 export interface CatalogChoice {
@@ -53,6 +61,19 @@ async function detectConfiguredProviders(models: Models): Promise<Set<string>> {
     new Promise((resolve) => setTimeout(resolve, 3_000).unref?.()),
   ]);
   return detected;
+}
+
+/** Sentinel choice that opens the custom-endpoint flow instead of selecting a provider. */
+export const ADD_CUSTOM_PROVIDER = "+custom";
+
+export function customProviderChoice(): CatalogChoice {
+  return {
+    id: ADD_CUSTOM_PROVIDER,
+    badge: "custom",
+    label: `${ui.style.accent("+")}  Add a local or custom endpoint`,
+    description: "Any OpenAI- or Anthropic-compatible URL · Ollama, llama.cpp, vLLM, LM Studio, a proxy, or a private gateway",
+    searchText: "custom local endpoint base url self-hosted ollama llamacpp llama.cpp vllm sglang lm studio openai compatible proxy gateway offline",
+  };
 }
 
 export function providerCatalogChoices(models: Models, configured: ReadonlySet<string> = new Set()): CatalogChoice[] {
@@ -206,6 +227,133 @@ async function availableModels(models: Models, provider: Provider): Promise<read
   return candidates;
 }
 
+const API_CHOICES: CatalogChoice[] = [
+  {
+    id: "openai-completions",
+    badge: "openai-completions",
+    label: "OpenAI-compatible chat completions",
+    description: "POST /chat/completions · what Ollama, llama.cpp, vLLM, SGLang, LM Studio, and most proxies serve",
+  },
+  {
+    id: "openai-responses",
+    badge: "openai-responses",
+    label: "OpenAI Responses",
+    description: "POST /responses · endpoints emulating OpenAI's newer surface",
+  },
+  {
+    id: "anthropic-messages",
+    badge: "anthropic-messages",
+    label: "Anthropic Messages",
+    description: "POST /v1/messages · endpoints emulating Anthropic's surface",
+  },
+];
+
+async function promptForTokenCount(label: string, fallback: number): Promise<number> {
+  const answer = await ui.text({
+    label,
+    placeholder: `(Enter for ${fallback.toLocaleString("en-US")})`,
+    allowEmpty: true,
+    validate: (value) => {
+      if (!value) return undefined;
+      const parsed = Number(value.replaceAll(/[,_\s]/g, ""));
+      return Number.isSafeInteger(parsed) && parsed > 0 ? undefined : "Enter a positive whole number of tokens.";
+    },
+  });
+  return answer ? Number(answer.replaceAll(/[,_\s]/g, "")) : fallback;
+}
+
+/**
+ * Define one endpoint Pi has never heard of. Everything asked for here is
+ * something the endpoint itself cannot be trusted to report: a served model's
+ * real context window is the usual example, and a wrong guess is only found
+ * later, as a rejected request in the middle of an unattended cycle.
+ */
+async function promptForCustomProvider(
+  models: MutableModels,
+  store: CustomProviderStore,
+): Promise<CustomProviderDefinition> {
+  ui.heading(
+    "Local or custom endpoint",
+    "Point Rogue at any OpenAI- or Anthropic-compatible server, including one running on this machine.",
+  );
+  const baseUrl = await ui.text({
+    label: "Base URL",
+    placeholder: "(e.g. http://127.0.0.1:11434/v1)",
+    hint: "Use the same root a client would: usually the one ending in /v1.",
+    validate: (value) => {
+      try {
+        normalizeCustomBaseUrl(value);
+        return undefined;
+      } catch (error) {
+        return error instanceof Error ? error.message : String(error);
+      }
+    },
+  });
+
+  const stored = new Set((await store.list()).map((definition) => definition.id));
+  const suggestedId = suggestCustomProviderId(baseUrl, new Set(models.getProviders().map((provider) => provider.id)));
+  const id = (await ui.text({
+    label: "Provider ID",
+    placeholder: `(Enter for ${suggestedId})`,
+    allowEmpty: true,
+    validate: (value) => {
+      if (value && models.getProvider(value.toLocaleLowerCase()) && !stored.has(value.toLocaleLowerCase())) {
+        return `${value} already belongs to a built-in Pi provider. Choose another ID.`;
+      }
+      return undefined;
+    },
+  })).toLocaleLowerCase() || suggestedId;
+  const suggestedName = new URL(baseUrl).host;
+  const name = (await ui.text({
+    label: "Display name",
+    placeholder: `(Enter for ${suggestedName})`,
+    allowEmpty: true,
+  })) || suggestedName;
+  const api = (await choose("Which API does this endpoint speak?", API_CHOICES, {
+    subtitle: "Pick the request format the server accepts, not the model family it runs.",
+    confirmLabel: "API",
+  })).id as CustomProviderApi;
+  const contextWindow = await promptForTokenCount(
+    "Context window",
+    DEFAULT_CUSTOM_CONTEXT_WINDOW,
+  );
+  const requiresApiKey = await ui.confirm("Does this endpoint require an API key?", false);
+
+  const definition = await saveCustomProvider(models, store, { id, name, baseUrl, api, contextWindow, requiresApiKey });
+  if (requiresApiKey) {
+    await models.login(definition.id, "api_key", createInteraction());
+    ui.success(`Stored a credential for ${ui.style.bold(name)}.`);
+  }
+  ui.panel("Custom endpoint saved", [
+    ["Provider", `${name} ${ui.style.faint(definition.id)}`],
+    ["Base URL", definition.baseUrl],
+    ["API", api],
+    ["Context", `${contextWindow.toLocaleString("en-US")} tokens`],
+    ["Credential", requiresApiKey ? "stored API key" : ui.style.faint("none required")],
+    ["Definition", store.path],
+  ]);
+  return definition;
+}
+
+/**
+ * A server without a catalog endpoint is still perfectly usable — it just has
+ * to be told what it serves, since nothing else can find out.
+ */
+async function promptForCustomModel(
+  models: MutableModels,
+  store: CustomProviderStore,
+  definition: CustomProviderDefinition,
+): Promise<readonly Model<Api>[]> {
+  ui.warn(`${definition.name ?? definition.id} did not return a model catalog. Name the model it serves instead.`);
+  const modelId = await ui.text({
+    label: "Model ID",
+    placeholder: "(exactly as the endpoint names it)",
+    hint: "For example qwen3-coder:30b on Ollama, or the served-model-name a vLLM instance was started with.",
+  });
+  await saveCustomProvider(models, store, { ...definition, models: [{ id: modelId }] });
+  return models.getAvailable(definition.id);
+}
+
 interface ProviderSetupOptions {
   stateDirectory?: string;
   provider?: string;
@@ -219,11 +367,8 @@ interface ProviderSetupOptions {
 /** Interactive provider authentication and model selection shared by first-run and --auth. */
 export async function runProviderSetup(options: ProviderSetupOptions = {}): Promise<void> {
   if (!process.stdin.isTTY) throw new Error("Provider setup needs an interactive terminal. Run Rogue directly in a terminal.");
-  initializeBundledProviderRuntime();
   const directory = options.stateDirectory ?? ".rogue";
-  const credentials = new FileCredentialStore(`${directory}/auth.json`);
-  const modelsStore = new FileModelsStore(`${directory}/model-catalogs.json`);
-  const models = builtinModels({ credentials, modelsStore });
+  const { models, credentials, customProviders } = await createRogueModels(directory);
   const config = new RogueConfigStore(directory);
   let presetProvider = options.provider;
   let presetModel = options.model;
@@ -245,22 +390,34 @@ export async function runProviderSetup(options: ProviderSetupOptions = {}): Prom
   });
 
   while (configureAnother) {
-    const provider = presetProvider
-      ? models.getProvider(presetProvider)
-      : models.getProvider((await choose("Choose a provider", providerCatalogChoices(models, detected), {
-        subtitle: "Providers with usable credentials are listed first.",
+    let created: CustomProviderDefinition | undefined;
+    let selectedId = presetProvider;
+    if (!selectedId) {
+      selectedId = (await choose("Choose a provider", [customProviderChoice(), ...providerCatalogChoices(models, detected)], {
+        subtitle: "Providers with usable credentials are listed first; the first entry accepts any endpoint URL.",
         confirmLabel: "Provider",
-      })).id);
-    if (!provider) throw new Error(`Unknown Pi provider: ${presetProvider}`);
+      })).id;
+      if (selectedId === ADD_CUSTOM_PROVIDER) {
+        created = await promptForCustomProvider(models, customProviders);
+        selectedId = created.id;
+      }
+    }
+    const provider = models.getProvider(selectedId);
+    if (!provider) throw new Error(`Unknown Pi provider: ${selectedId}`);
     if (presetProvider) ui.success(`${ui.style.faint("Provider ·")} ${ui.style.bold(provider.name)} ${ui.style.faint(provider.id)}`);
 
-    const authentication = await selectAuthentication(provider, models, options.authType);
-    if (authentication !== "existing") {
-      await models.login(provider.id, authentication, createInteraction());
-      ui.success(`Authenticated ${ui.style.bold(provider.name)}.`);
+    // A just-created endpoint has already answered the credential question, so
+    // asking again would only offer the choice it was configured with.
+    if (!created) {
+      const authentication = await selectAuthentication(provider, models, options.authType);
+      if (authentication !== "existing") {
+        await models.login(provider.id, authentication, createInteraction());
+        ui.success(`Authenticated ${ui.style.bold(provider.name)}.`);
+      }
     }
 
-    const candidates = await availableModels(models, provider);
+    let candidates = await availableModels(models, provider);
+    if (!candidates.length && created) candidates = await promptForCustomModel(models, customProviders, created);
     if (!candidates.length) throw new Error(`No models are available for ${provider.name} after authentication.`);
     let model: Model<Api> | undefined;
     if (presetModel) {

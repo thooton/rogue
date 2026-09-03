@@ -1,7 +1,4 @@
 import { Agent, convertToLlm, type ThinkingLevel } from "@earendil-works/pi-agent-core";
-import { builtinModels } from "@earendil-works/pi-ai/providers/all";
-import { FileCredentialStore } from "./credentials.js";
-import { FileModelsStore } from "./model-catalog-store.js";
 import { RogueStore } from "./store.js";
 import { buildSystemPrompt } from "./system-prompt.js";
 import { createRogueTools } from "./tools.js";
@@ -10,7 +7,7 @@ import { NostrService } from "./nostr.js";
 import { RogueConfigStore } from "./config.js";
 import { createFailoverStream, type ModelFailoverNotice } from "./model-router.js";
 import type { CacheRetention } from "@earendil-works/pi-ai";
-import { initializeBundledProviderRuntime } from "./provider-runtime.js";
+import { createRogueModels } from "./provider-runtime.js";
 import { createAutomaticContextCompactor } from "./context-compaction.js";
 import { isDurableMessage, SessionStore, type RestoredSession } from "./session.js";
 
@@ -39,13 +36,10 @@ export async function createRogueAgent(options: RogueAgentOptions = {}): Promise
   model: string;
   systemPrompt: string;
 }> {
-  initializeBundledProviderRuntime();
   const stateDirectory = options.stateDirectory ?? ".rogue";
   const thinkingLevel = options.thinkingLevel ?? "medium";
 
-  const credentials = new FileCredentialStore(`${stateDirectory}/auth.json`);
-  const modelsStore = new FileModelsStore(`${stateDirectory}/model-catalogs.json`);
-  const models = builtinModels({ credentials, modelsStore });
+  const { models, credentials, customProviders } = await createRogueModels(stateDirectory);
   await models.refresh({ allowNetwork: false });
   const config = new RogueConfigStore(stateDirectory);
   const configuredRoutes = await config.listProviders();
@@ -93,12 +87,7 @@ export async function createRogueAgent(options: RogueAgentOptions = {}): Promise
         nostr,
         config,
         models,
-        apiKeyProviderIds: new Set(
-          models
-            .getProviders()
-            .filter((candidate) => candidate.auth.apiKey)
-            .map((candidate) => candidate.id),
-        ),
+        customProviders,
       }),
     },
     streamFn: createFailoverStream({
@@ -119,7 +108,7 @@ export async function createRogueAgent(options: RogueAgentOptions = {}): Promise
     // at a cold cache and paid to rewrite a prefix the provider still had.
     sessionId: `rogue-${profile.id}`,
     afterToolCall: async ({ toolCall, context }) => {
-      if (toolCall.name !== "set_api_key") return undefined;
+      if (!("apiKey" in toolCall.arguments)) return undefined;
       // Scrub the secret before Pi's automatic follow-up turn reuses this transcript.
       for (const message of context.messages) {
         if (message.role !== "assistant") continue;

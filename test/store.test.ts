@@ -37,7 +37,16 @@ import { once } from "node:events";
 import type { AddressInfo } from "node:net";
 import { WebSocketServer } from "ws";
 import { builtinModels } from "@earendil-works/pi-ai/providers/all";
-import { initializeBundledProviderRuntime } from "../src/provider-runtime.js";
+import { createRogueModels, initializeBundledProviderRuntime } from "../src/provider-runtime.js";
+import {
+  createCustomProvider,
+  DEFAULT_CUSTOM_CONTEXT_WINDOW,
+  normalizeCustomProvider,
+  parseCustomProviderSpec,
+  removeCustomProvider,
+  saveCustomProvider,
+} from "../src/custom-providers.js";
+import { createServer, type IncomingMessage } from "node:http";
 import { compactionThreshold, createAutomaticContextCompactor } from "../src/context-compaction.js";
 import {
   networkCharacterCount,
@@ -143,7 +152,7 @@ describe("Rogue agent configuration", () => {
     const store = await temporaryStore();
     const credentials = new FileCredentialStore(path.join(store.directory, "auth.json"));
     const personas = await PersonaDatabase.open(store.directory);
-    const tools = createRogueTools(store, { credentials, personas, apiKeyProviderIds: new Set(["openai"]) });
+    const tools = createRogueTools(store, { credentials, personas, models: builtinModels() });
     expect(tools.map((tool) => tool.name)).toEqual([
       "read",
       "bash",
@@ -166,6 +175,8 @@ describe("Rogue agent configuration", () => {
       "list_models",
       "configure_model_provider",
       "disable_model_provider",
+      "add_custom_model_provider",
+      "remove_custom_model_provider",
       "list_personas",
       "create_persona",
       "nostr_identity",
@@ -173,6 +184,8 @@ describe("Rogue agent configuration", () => {
       "add_nostr_relay",
       "read_nostr_messages",
       "publish_nostr_message",
+      "send_direct_message",
+      "read_direct_messages",
     ]);
     personas.close();
   });
@@ -190,7 +203,7 @@ describe("Rogue agent configuration", () => {
   it("never returns a stored API key from its credential tool", async () => {
     const store = await temporaryStore();
     const credentials = new FileCredentialStore(path.join(store.directory, "auth.json"));
-    const tools = createRogueTools(store, { credentials, apiKeyProviderIds: new Set(["openai"]) });
+    const tools = createRogueTools(store, { credentials, models: builtinModels() });
     const setApiKey = tools.find((tool) => tool.name === "set_api_key");
     if (!setApiKey) throw new Error("set_api_key tool missing");
 
@@ -425,6 +438,256 @@ describe("provider configuration", () => {
   });
 });
 
+describe("custom and local model endpoints", () => {
+  /** A stand-in for the OpenAI-compatible catalog every local server exposes. */
+  async function catalogServer(handler: (request: IncomingMessage) => { status?: number; body: unknown }): Promise<{
+    baseUrl: string;
+    requests: { url: string; authorization?: string }[];
+    close: () => Promise<void>;
+  }> {
+    const requests: { url: string; authorization?: string }[] = [];
+    const server = createServer((request, response) => {
+      requests.push({ url: request.url ?? "", authorization: request.headers.authorization });
+      const { status = 200, body } = handler(request);
+      response.writeHead(status, { "content-type": "application/json" });
+      response.end(JSON.stringify(body));
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const { port } = server.address() as AddressInfo;
+    return {
+      baseUrl: `http://127.0.0.1:${port}/v1`,
+      requests,
+      close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+    };
+  }
+
+  it("normalizes definitions and rejects ones no client could use", () => {
+    const definition = normalizeCustomProvider({ id: "Local", baseUrl: "http://127.0.0.1:11434/v1/", models: ["qwen3:8b"] });
+    expect(definition).toMatchObject({ id: "local", baseUrl: "http://127.0.0.1:11434/v1", models: [{ id: "qwen3:8b" }] });
+
+    expect(() => normalizeCustomProvider({ id: "local", baseUrl: "127.0.0.1:11434" })).toThrow(/not a valid URL/);
+    expect(() => normalizeCustomProvider({ id: "local", baseUrl: "ftp://host/v1" })).toThrow(/http:\/\/ or https:\/\//);
+    expect(() => normalizeCustomProvider({ id: "Not Valid", baseUrl: "http://host/v1" })).toThrow(/Invalid custom provider ID/);
+    expect(() => normalizeCustomProvider({ id: "local", baseUrl: "http://host/v1", api: "grpc" })).toThrow(/Unsupported custom provider API/);
+    expect(() => normalizeCustomProvider({ id: "local", baseUrl: "http://host/v1", contextWindow: 0 })).toThrow(/positive integer/);
+
+    expect(parseCustomProviderSpec("local=http://127.0.0.1:8080/v1")).toMatchObject({ id: "local", baseUrl: "http://127.0.0.1:8080/v1" });
+    expect(() => parseCustomProviderSpec("http://127.0.0.1:8080/v1")).toThrow(/<id>=<base-url>/);
+  });
+
+  it("builds keyless models an unrecognized server will actually accept", async () => {
+    const provider = createCustomProvider(normalizeCustomProvider({
+      id: "local",
+      name: "Workstation",
+      baseUrl: "http://127.0.0.1:11434/v1",
+      models: [{ id: "qwen3:8b" }],
+    }));
+    const model = provider.getModels()[0]!;
+    expect(model).toMatchObject({
+      id: "qwen3:8b",
+      provider: "local",
+      api: "openai-completions",
+      baseUrl: "http://127.0.0.1:11434/v1",
+      contextWindow: DEFAULT_CUSTOM_CONTEXT_WINDOW,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    });
+    // Pi reads an unknown base URL as current OpenAI cloud. None of that
+    // dialect survives contact with a self-hosted server.
+    expect(model.compat).toMatchObject({
+      supportsDeveloperRole: false,
+      supportsStore: false,
+      maxTokensField: "max_tokens",
+      supportsLongCacheRetention: false,
+    });
+    // Output can never exceed the window the server was actually started with.
+    expect(model.maxTokens).toBeLessThanOrEqual(model.contextWindow);
+
+    const context = { env: async () => undefined, fileExists: async () => false };
+    const signal = new AbortController().signal;
+    await expect(provider.auth.apiKey!.resolve({ ctx: context, signal })).resolves.toMatchObject({
+      auth: { apiKey: expect.any(String) },
+    });
+    const guarded = createCustomProvider(normalizeCustomProvider({ id: "gateway", baseUrl: "https://gateway.example/v1", requiresApiKey: true }));
+    await expect(guarded.auth.apiKey!.resolve({ ctx: context, signal })).resolves.toBeUndefined();
+  });
+
+  it("discovers a running endpoint's catalog and routes an agent to it", async () => {
+    const endpoint = await catalogServer(() => ({
+      body: { object: "list", data: [{ id: "qwen3-coder:30b", max_model_len: 262144 }, { id: "gemma3:27b" }] },
+    }));
+    const directory = await mkdtemp(path.join(tmpdir(), "rogue-custom-test-"));
+    try {
+      const { models, customProviders } = await createRogueModels(directory);
+      await saveCustomProvider(models, customProviders, { id: "local", name: "Workstation", baseUrl: endpoint.baseUrl });
+      await models.refresh({ providers: ["local"], force: true });
+
+      expect(endpoint.requests[0]?.url).toBe("/v1/models");
+      expect(models.getModels("local").map((model) => model.id)).toEqual(["qwen3-coder:30b", "gemma3:27b"]);
+      // A server that publishes its real window is believed over the default.
+      expect(models.getModel("local", "qwen3-coder:30b")?.contextWindow).toBe(262_144);
+      expect(models.getModel("local", "gemma3:27b")?.contextWindow).toBe(DEFAULT_CUSTOM_CONTEXT_WINDOW);
+      // A keyless endpoint is configured by existing, so its models are selectable.
+      await expect(models.getAvailable("local")).resolves.toHaveLength(2);
+
+      // The definition and the discovered catalog both survive a restart, and
+      // the second process resolves the same route without touching the network.
+      const restarted = await createRogueModels(directory);
+      await restarted.models.refresh({ allowNetwork: false });
+      expect(restarted.models.getModel("local", "qwen3-coder:30b")).toBeDefined();
+      expect(endpoint.requests).toHaveLength(1);
+    } finally {
+      await endpoint.close();
+    }
+  });
+
+  it("sends a self-hosted server only the request fields it understands", async () => {
+    let body: Record<string, unknown> | undefined;
+    const server = createServer((request, response) => {
+      if (request.url === "/v1/models") {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({ data: [{ id: "qwen3:8b" }] }));
+        return;
+      }
+      const chunks: Buffer[] = [];
+      request.on("data", (chunk: Buffer) => chunks.push(chunk));
+      request.on("end", () => {
+        body = JSON.parse(Buffer.concat(chunks).toString()) as Record<string, unknown>;
+        response.writeHead(200, { "content-type": "text/event-stream" });
+        for (const event of [
+          { choices: [{ index: 0, delta: { role: "assistant", content: "Hello" } }] },
+          { choices: [{ index: 0, delta: { content: " from a local model" }, finish_reason: "stop" }] },
+        ]) {
+          response.write(`data: ${JSON.stringify({ id: "1", object: "chat.completion.chunk", model: "qwen3:8b", ...event })}\n\n`);
+        }
+        response.write("data: [DONE]\n\n");
+        response.end();
+      });
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const { port } = server.address() as AddressInfo;
+    const directory = await mkdtemp(path.join(tmpdir(), "rogue-custom-test-"));
+    try {
+      const { models, customProviders } = await createRogueModels(directory);
+      await saveCustomProvider(models, customProviders, { id: "local", baseUrl: `http://127.0.0.1:${port}/v1` });
+      await models.refresh({ providers: ["local"], force: true });
+      const model = models.getModel("local", "qwen3:8b")!;
+
+      let text = "";
+      // Rogue asks every route for its longest prompt cache retention, which is
+      // the request an unrecognized endpoint is least likely to survive.
+      const stream = models.streamSimple(model, {
+        systemPrompt: "You are a test.",
+        messages: [{ role: "user", content: [{ type: "text", text: "Say hi" }], timestamp: Date.now() }],
+        tools: [{ name: "ping", description: "Ping", parameters: { type: "object", properties: {}, required: [] } }],
+      }, { maxTokens: 256, cacheRetention: DEFAULT_CACHE_RETENTION, sessionId: "rogue-test" });
+      for await (const event of stream) {
+        if (event.type === "text_delta") text += event.delta;
+        if (event.type === "error") throw new Error(event.error.errorMessage ?? "stream failed");
+      }
+      expect(text).toBe("Hello from a local model");
+
+      // Pi's defaults for an unknown host are the current OpenAI cloud dialect.
+      // Every field below is one a self-hosted server rejects or chokes on.
+      expect(body).toBeDefined();
+      expect(body).not.toHaveProperty("store");
+      expect(body).not.toHaveProperty("max_completion_tokens");
+      expect(body).not.toHaveProperty("prompt_cache_key");
+      expect(body).not.toHaveProperty("prompt_cache_retention");
+      expect(body).toMatchObject({ model: "qwen3:8b", max_tokens: 256 });
+      expect((body!.messages as { role: string }[])[0]?.role).toBe("system");
+      expect((body!.tools as { function: { strict?: boolean } }[])[0]?.function.strict).toBeUndefined();
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it("refuses to shadow a built-in provider and forgets what it removes", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "rogue-custom-test-"));
+    const { models, customProviders } = await createRogueModels(directory);
+    await expect(saveCustomProvider(models, customProviders, { id: "openai", baseUrl: "http://127.0.0.1:8080/v1" }))
+      .rejects.toThrow(/already belongs to a built-in/);
+
+    await saveCustomProvider(models, customProviders, { id: "local", baseUrl: "http://127.0.0.1:8080/v1", models: ["m"] });
+    // Overwriting an endpoint Rogue itself registered stays allowed.
+    await saveCustomProvider(models, customProviders, { id: "local", baseUrl: "http://127.0.0.1:9090/v1", models: ["m"] });
+    expect(models.getModel("local", "m")?.baseUrl).toBe("http://127.0.0.1:9090/v1");
+
+    await expect(removeCustomProvider(models, customProviders, "local")).resolves.toBe(true);
+    expect(models.getProvider("local")).toBeUndefined();
+    await expect(customProviders.list()).resolves.toEqual([]);
+    await expect(removeCustomProvider(models, customProviders, "local")).resolves.toBe(false);
+
+    // A definition that would silently replace a built-in provider's models is
+    // a startup failure, not a substitution.
+    await writeFile(customProviders.path, JSON.stringify({ providers: [{ id: "anthropic", baseUrl: "http://127.0.0.1:8080/v1" }] }));
+    await expect(createRogueModels(directory)).rejects.toThrow(/shadows a built-in/);
+  });
+
+  it("registers and retires endpoints through the agent's own tools", async () => {
+    const endpoint = await catalogServer(() => ({ body: { data: [{ id: "llama3.3:70b" }] } }));
+    const directory = await mkdtemp(path.join(tmpdir(), "rogue-custom-test-"));
+    try {
+      const store = new RogueStore(directory);
+      const { models, credentials, customProviders } = await createRogueModels(directory);
+      const config = new RogueConfigStore(directory);
+      const tools = createRogueTools(store, { models, customProviders, config, credentials });
+      const add = tools.find((tool) => tool.name === "add_custom_model_provider")!;
+
+      const added = await add.execute("call-add", {
+        id: "local",
+        name: "Workstation",
+        baseUrl: endpoint.baseUrl,
+        apiKey: "never-print-me",
+      });
+      expect(JSON.stringify(added)).not.toContain("never-print-me");
+      expect(JSON.stringify(added)).toContain("llama3.3:70b");
+      expect(endpoint.requests[0]?.authorization).toBe("Bearer never-print-me");
+      // The key belongs in the credential store, never in the definition file.
+      await expect(credentials.list()).resolves.toEqual([{ providerId: "local", type: "api_key" }]);
+      expect(await readFile(customProviders.path, "utf8")).not.toContain("never-print-me");
+
+      const configure = tools.find((tool) => tool.name === "configure_model_provider")!;
+      await configure.execute("call-route", { provider: "local", model: "llama3.3:70b", priority: 0 });
+      await expect(config.listProviders()).resolves.toEqual([
+        { provider: "local", model: "llama3.3:70b", priority: 0, enabled: true },
+      ]);
+
+      // A route left pointing at a removed endpoint would fail every request.
+      const remove = tools.find((tool) => tool.name === "remove_custom_model_provider")!;
+      await remove.execute("call-remove", { id: "local" });
+      expect(models.getProvider("local")).toBeUndefined();
+      await expect(config.listProviders()).resolves.toEqual([]);
+      await expect(remove.execute("call-remove-again", { id: "local" })).rejects.toThrow(/No custom provider/);
+    } finally {
+      await endpoint.close();
+    }
+  });
+
+  it("bootstraps a child Rogue against a local endpoint with no credential at all", async () => {
+    const endpoint = await catalogServer(() => ({ body: { data: [{ id: "qwen3:8b" }] } }));
+    const directory = await mkdtemp(path.join(tmpdir(), "rogue-custom-test-"));
+    const bootstrap = path.join(directory, "initial_auth.json");
+    try {
+      await writeFile(bootstrap, JSON.stringify({
+        customProviders: [{ id: "local", name: "Workstation", baseUrl: endpoint.baseUrl, contextWindow: 65536 }],
+      }));
+      await expect(importInitialAuthentication(directory, bootstrap)).resolves.toBe(true);
+      await expect(new RogueConfigStore(directory).listProviders()).resolves.toEqual([
+        { provider: "local", model: "qwen3:8b", priority: 0, enabled: true },
+      ]);
+      await expect(new FileCredentialStore(path.join(directory, "auth.json")).list()).resolves.toEqual([]);
+
+      const { models } = await createRogueModels(directory);
+      await models.refresh({ allowNetwork: false });
+      expect(models.getModel("local", "qwen3:8b")?.contextWindow).toBe(65_536);
+    } finally {
+      await endpoint.close();
+    }
+  });
+});
+
 describe("prompt cache usage", () => {
   const usage = (input: number, cacheRead: number, cacheWrite: number, cost = 0): Usage => ({
     input, output: 10, cacheRead, cacheWrite, totalTokens: input + cacheRead + cacheWrite + 10,
@@ -505,10 +768,10 @@ describe("Nostr network", () => {
     await nostr.addRelay(relay.url);
     try {
       const published = await nostr.publish("Hello from Rogue");
-      const events = await nostr.read({ kinds: [1], authors: [published.event.pubkey], limit: 10 });
+      const page = await nostr.read({ kinds: [1], authors: [published.event.pubkey], limit: 10 });
 
       expect(published.accepted).toContain(`${relay.url}/`);
-      expect(events.some((event) => event.id === published.event.id && event.content === "Hello from Rogue")).toBe(true);
+      expect(page.events.some((event) => event.id === published.event.id && event.content === "Hello from Rogue")).toBe(true);
       expect((await nostr.identity()).pubkey).toBe(published.event.pubkey);
     } finally {
       await relay.close();
@@ -520,8 +783,10 @@ describe("Nostr network", () => {
     const nostr = new NostrService(directory, { defaultRelays: [] });
     await expect(nostr.publish("x".repeat(ROGUE_PUBLIC_CHARACTER_LIMIT + 1)))
       .rejects.toThrow("280-character limit");
-    await expect(nostr.publish("x".repeat(ROGUE_DIRECT_CHARACTER_LIMIT + 1), 4))
-      .rejects.toThrow("2000-character limit");
+    // A direct-message kind has no plaintext publication path at all: sending
+    // one unencrypted would defeat the point of the kind.
+    await expect(nostr.publish("x".repeat(ROGUE_DIRECT_CHARACTER_LIMIT), 4))
+      .rejects.toThrow("cannot be published in the clear");
   });
 
   it("drops oversized events served by a relay that is not a Rogue relay", async () => {
@@ -536,8 +801,8 @@ describe("Nostr network", () => {
     relay.seed(oversized);
     relay.seed(acceptable);
     try {
-      const events = await nostr.read({ kinds: [1], limit: 10 });
-      expect(events.map((event) => event.id)).toEqual([acceptable.id]);
+      const page = await nostr.read({ kinds: [1], limit: 10 });
+      expect(page.events.map((event) => event.id)).toEqual([acceptable.id]);
     } finally {
       await relay.close();
     }

@@ -1,11 +1,9 @@
 import { readFile, unlink } from "node:fs/promises";
 import path from "node:path";
 import type { Api, Credential, Model } from "@earendil-works/pi-ai";
-import { builtinModels } from "@earendil-works/pi-ai/providers/all";
-import { FileCredentialStore } from "./credentials.js";
-import { FileModelsStore } from "./model-catalog-store.js";
 import { RogueConfigStore } from "./config.js";
-import { initializeBundledProviderRuntime } from "./provider-runtime.js";
+import { createRogueModels } from "./provider-runtime.js";
+import { normalizeCustomProvider, saveCustomProvider, type CustomProviderDefinition } from "./custom-providers.js";
 import { NostrService } from "./nostr.js";
 
 interface InitialRoute {
@@ -20,6 +18,7 @@ interface InitialAuthDocument {
   credentials?: Record<string, unknown>;
   routes?: InitialRoute[];
   providers?: InitialRoute[];
+  customProviders?: unknown[];
   relays?: string[];
 }
 
@@ -80,7 +79,8 @@ export async function importInitialAuthentication(stateDirectory = ".rogue", exp
 
   const parsed = JSON.parse(await readFile(bootstrapPath, "utf8")) as unknown;
   if (!isObject(parsed)) throw new Error("initial_auth.json must contain a JSON object.");
-  const hasStructuredKeys = "credentials" in parsed || "routes" in parsed || "providers" in parsed || "relays" in parsed;
+  const hasStructuredKeys = "credentials" in parsed || "routes" in parsed || "providers" in parsed
+    || "customProviders" in parsed || "relays" in parsed;
   const document: InitialAuthDocument = hasStructuredKeys
     ? parsed as InitialAuthDocument
     : { credentials: parsed };
@@ -89,7 +89,11 @@ export async function importInitialAuthentication(stateDirectory = ".rogue", exp
   }
   if (document.routes !== undefined && !Array.isArray(document.routes)) throw new Error("initial_auth.json routes must be an array.");
   if (document.providers !== undefined && !Array.isArray(document.providers)) throw new Error("initial_auth.json providers must be an array.");
+  if (document.customProviders !== undefined && !Array.isArray(document.customProviders)) {
+    throw new Error("initial_auth.json customProviders must be an array.");
+  }
   if (document.relays !== undefined && !Array.isArray(document.relays)) throw new Error("initial_auth.json relays must be an array.");
+  const customDefinitions: CustomProviderDefinition[] = (document.customProviders ?? []).map(normalizeCustomProvider);
   const relays = (document.relays ?? []).map((relay) => {
     if (typeof relay !== "string") throw new Error("Every initial_auth.json relay must be a URL string.");
     const url = new URL(relay.trim());
@@ -108,16 +112,15 @@ export async function importInitialAuthentication(stateDirectory = ".rogue", exp
     if (route.credential !== undefined) credentialsByProvider.set(route.provider, normalizeCredential(route.credential, route.provider));
     else if (route.apiKey) credentialsByProvider.set(route.provider, { type: "api_key", key: route.apiKey });
   }
-  if (!credentialsByProvider.size && !routes.length && !relays.length) {
-    throw new Error("initial_auth.json must define at least one credential, provider route, or relay.");
+  if (!credentialsByProvider.size && !routes.length && !relays.length && !customDefinitions.length) {
+    throw new Error("initial_auth.json must define at least one credential, provider route, custom provider, or relay.");
   }
 
-  initializeBundledProviderRuntime();
-  const credentials = new FileCredentialStore(`${stateDirectory}/auth.json`);
-  const models = builtinModels({
-    credentials,
-    modelsStore: new FileModelsStore(`${stateDirectory}/model-catalogs.json`),
-  });
+  const { models, credentials, customProviders } = await createRogueModels(stateDirectory);
+  // Custom endpoints are registered first: a credential or route in the same
+  // file is allowed to name one, and a keyless local server is often the only
+  // provider a bootstrapped child is given.
+  for (const definition of customDefinitions) await saveCustomProvider(models, customProviders, definition);
   for (const [providerId, credential] of credentialsByProvider) {
     const provider = models.getProvider(providerId);
     if (!provider) throw new Error(`initial_auth.json names unknown provider ${providerId}.`);
@@ -133,14 +136,17 @@ export async function importInitialAuthentication(stateDirectory = ".rogue", exp
     await credentials.modify(providerId, async () => structuredClone(credential));
   }
   await models.refresh({ allowNetwork: false });
-  const refresh = await models.refresh({ providers: [...credentialsByProvider.keys()], force: true });
+  // A custom endpoint usually carries no credential at all, so it is refreshed
+  // by name rather than by having one.
+  const refreshable = [...new Set([...credentialsByProvider.keys(), ...customDefinitions.map((definition) => definition.id)])];
+  const refresh = await models.refresh({ providers: refreshable, force: true });
   for (const [providerId, error] of refresh.errors) {
     if (!models.getModels(providerId).length) throw new Error(`Could not load ${providerId}'s model catalog: ${error.message}`);
   }
 
   const requestedRoutes: InitialRoute[] = routes.length
     ? routes
-    : [...credentialsByProvider.keys()].map((provider) => ({ provider }));
+    : refreshable.map((provider) => ({ provider }));
   const config = new RogueConfigStore(stateDirectory);
   const configured: { provider: string; model: string; priority: number }[] = [];
   for (let index = 0; index < requestedRoutes.length; index += 1) {
@@ -161,6 +167,9 @@ export async function importInitialAuthentication(stateDirectory = ".rogue", exp
   for (const relay of relays) await nostr.addRelay(relay);
 
   await unlink(bootstrapPath);
+  if (customDefinitions.length) {
+    console.log(`Imported ${customDefinitions.length} custom endpoint${customDefinitions.length === 1 ? "" : "s"}: ${customDefinitions.map((definition) => `${definition.id} (${definition.baseUrl})`).join(", ")}.`);
+  }
   if (configured.length) console.log(`Imported one-time authentication for ${configured.map((route) => `${route.provider}/${route.model}`).join(", ")}.`);
   if (relays.length) console.log(`Imported ${relays.length} Rogue Network relay${relays.length === 1 ? "" : "s"}.`);
   console.log(`Consumed and deleted ${bootstrapPath}.`);

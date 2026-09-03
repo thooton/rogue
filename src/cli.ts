@@ -14,7 +14,8 @@ import {
   type AutonomousCycleResult,
 } from "./autonomy.js";
 import { isDurableMessage, SessionStore } from "./session.js";
-import { verifyBundledProviderRuntime } from "./provider-runtime.js";
+import { createRogueModels, verifyBundledProviderRuntime } from "./provider-runtime.js";
+import { parseCustomProviderSpec, saveCustomProvider } from "./custom-providers.js";
 import { RogueConfigStore } from "./config.js";
 import { addCacheUsage, emptyCacheUsage, formatCacheUsage, type CacheUsageTotals } from "./cache-usage.js";
 import { importInitialAuthentication } from "./initial-auth.js";
@@ -36,6 +37,7 @@ interface CliOptions {
   apiKeyProvider?: string;
   inspectHost: string;
   nostrRelays: string[];
+  customProviders: string[];
   allowFailover: boolean;
   cacheRetention?: CacheRetention;
   freshSession: boolean;
@@ -72,6 +74,7 @@ Options:
   --api-key <id>     Run a provider's API credential setup and choose a model
   --inspect-host <ip> Transcript server bind address (default: 127.0.0.1)
   --nostr-relay <url> Persist a starter relay URL (repeatable)
+  --custom-provider <id>=<url> Register an OpenAI-compatible endpoint (repeatable)
   --no-failover      Pin --provider/--model and never fall back to another route
   --cache-retention <r> Prompt cache retention: none|short|long (default: long)
   --self-check       Verify bundled provider modules without network access
@@ -98,6 +101,7 @@ export function parseArgs(args: string[]): CliOptions {
     authenticate: false,
     inspectHost: "127.0.0.1",
     nostrRelays: [],
+    customProviders: [],
     allowFailover: true,
     freshSession: false,
   };
@@ -119,6 +123,7 @@ export function parseArgs(args: string[]): CliOptions {
       options.apiKeyProvider = takeValue(args, index++, arg);
     } else if (arg === "--inspect-host") options.inspectHost = takeValue(args, index++, arg);
     else if (arg === "--nostr-relay") options.nostrRelays.push(takeValue(args, index++, arg));
+    else if (arg === "--custom-provider") options.customProviders.push(takeValue(args, index++, arg));
     else if (arg === "--no-failover") options.allowFailover = false;
     else if (arg === "--cache-retention") {
       const value = takeValue(args, index++, arg);
@@ -275,6 +280,15 @@ async function main(): Promise<void> {
   }
 
   await importInitialAuthentication(options.stateDirectory ?? ".rogue");
+  // After the bootstrap import, so an explicit flag overrides whatever a
+  // provisioning file said about the same endpoint ID.
+  if (options.customProviders.length) {
+    const { models, customProviders } = await createRogueModels(options.stateDirectory ?? ".rogue");
+    for (const specification of options.customProviders) {
+      const definition = await saveCustomProvider(models, customProviders, parseCustomProviderSpec(specification));
+      ui.success(`Custom provider ${ui.style.bold(definition.id)} ${ui.style.faint("→")} ${definition.baseUrl}`);
+    }
+  }
   const firstRun = await ensureActiveProfile(options);
   await ensureModelProvider(options, firstRun);
   if (firstRun) await configureInitialRelays(options);
