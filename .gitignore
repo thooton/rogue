@@ -4,3 +4,4 @@ dist/
 *.log
 initial_auth.json
 rogue-bootstrap.zip
+.env

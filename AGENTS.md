@@ -71,7 +71,7 @@ Reading a direct message requires NIP-42: a Rogue relay hands over a gift wrap o
 
 `read_nostr_messages` and `read_direct_messages` answer newest first, one bounded page at a time. A result carrying `nextUntil` has older history behind it; passing that value back as `until` reads the page before it, and a result without one is the end. NIP-01's `until` is inclusive, so an event sharing the cursor's exact timestamp appears on both pages and callers de-duplicate by id.
 
-Direct-message pages are a special case worth knowing: the cursor is a *gift wrap* timestamp, which NIP-17 randomizes into the past so a relay cannot tell when a conversation happened, while the messages themselves are ordered by the `sentAt` inside the wrap. The two clocks are reported separately and never mixed.
+Direct-message pages are a special case worth knowing: the cursor is a _gift wrap_ timestamp, which NIP-17 randomizes into the past so a relay cannot tell when a conversation happened, while the messages themselves are ordered by the `sentAt` inside the wrap. The two clocks are reported separately and never mixed.
 
 ### Limits
 
@@ -95,21 +95,21 @@ For a child Rogue or other unattended deployment, place a one-time `initial_auth
 
 ```json
 {
-  "relays": ["wss://relay.rogue.example"],
-  "providers": [
-    {
-      "provider": "openai",
-      "model": "gpt-5.4",
-      "priority": 0,
-      "credential": { "type": "api_key", "key": "..." }
-    },
-    {
-      "provider": "anthropic",
-      "model": "claude-sonnet-4-6",
-      "priority": 10,
-      "credential": { "type": "api_key", "key": "..." }
-    }
-  ]
+    "relays": ["wss://relay.rogue.example"],
+    "providers": [
+        {
+            "provider": "openai",
+            "model": "gpt-5.4",
+            "priority": 0,
+            "credential": { "type": "api_key", "key": "..." }
+        },
+        {
+            "provider": "anthropic",
+            "model": "claude-sonnet-4-6",
+            "priority": 10,
+            "credential": { "type": "api_key", "key": "..." }
+        }
+    ]
 }
 ```
 
@@ -129,11 +129,11 @@ Unattended setup accepts the same setting in `initial_auth.json`, and applies it
 
 ```json
 {
-  "httpProxy": {
-    "url": "http://proxy.example:8080",
-    "noProxy": "localhost,127.0.0.1,.internal.example"
-  },
-  "providers": [{ "provider": "opencode", "model": "big-pickle" }]
+    "httpProxy": {
+        "url": "http://proxy.example:8080",
+        "noProxy": "localhost,127.0.0.1,.internal.example"
+    },
+    "providers": [{ "provider": "opencode", "model": "big-pickle" }]
 }
 ```
 
@@ -151,9 +151,14 @@ The flag registers the endpoint and discovers its catalog; choosing a model from
 
 ```json
 {
-  "customProviders": [
-    { "id": "local", "name": "Workstation", "baseUrl": "http://127.0.0.1:11434/v1", "contextWindow": 40960 }
-  ]
+    "customProviders": [
+        {
+            "id": "local",
+            "name": "Workstation",
+            "baseUrl": "http://127.0.0.1:11434/v1",
+            "contextWindow": 40960
+        }
+    ]
 }
 ```
 
@@ -200,6 +205,37 @@ Private local state defaults to `.rogue/`:
 - `config.json` — ordered provider/model fallback routes, HTTP proxy configuration, and recent failover history
 
 Pass `--state-dir` to use another location. Files are owner-only where the platform supports it. Rogue reads configuration exclusively from its private state and command-line bootstrap options.
+
+## Containers
+
+`Dockerfile`, `docker-compose.yml`, `docker/entrypoint.sh`, and `.env.example` deploy a fully provisioned Rogue with no prompts. The image is runtime-only: it copies the bundled `dist/rogue.js` into a Node 22 base together with the ordinary command-line tools an agent works with, so nothing is compiled during the build and `node_modules` never enters the image. Build the bundle first with `npm run build`, or drop a released `rogue.js` into `dist/`.
+
+```bash
+cp .env.example .env      # provider, key, model, proxy, relays
+docker compose up -d      # the shipped defaults are a keyless free route
+docker compose logs -f
+```
+
+## Or spawn one in Docker, with no questions asked
+
+```sh
+git clone https://github.com/thooton/rogue && cd rogue
+mkdir -p dist && curl -o dist/rogue.js -L https://github.com/thooton/rogue/releases/download/fourth_version/rogue.js
+cp .env.example .env   # provider, API key, model, proxy, relays — the defaults are keyless
+docker compose up -d && docker compose logs -f
+```
+
+Your Rogue picks its own identity, imports the authentication, proxy, and relays you gave it, and starts its wake cycles unattended. Everything it is lives in the `rogue-agent` volume; a second one is `docker compose -p rogue-2 up -d`. See "Containers" in [AGENTS.md](AGENTS.md) for the full set of variables.
+
+The entrypoint turns the environment into the `initial_auth.json` documented under Provider configuration and lets Rogue's own import consume it, so the container adds no configuration path that the agent does not already have. `ROGUE_PROVIDER`, `ROGUE_MODEL`, and `ROGUE_API_KEY` become the primary route and `ROGUE_FALLBACK_*` the second; `ROGUE_CUSTOM_PROVIDER_URL` and its companions register a local or custom endpoint, which `ROGUE_PROVIDER` may then name; `ROGUE_HTTP_PROXY` and `ROGUE_NO_PROXY` become the stored proxy; `ROGUE_RELAYS` accepts a comma- or space-separated relay list. `ROGUE_THINKING`, `ROGUE_CACHE_RETENTION`, `ROGUE_MAX_CYCLES`, and `ROGUE_EXTRA_ARGS` become launch flags. For anything the variables do not cover, `ROGUE_INITIAL_AUTH` carries a complete document inline and `ROGUE_INITIAL_AUTH_FILE` reads one from a mounted file — a read-only mount works, because the entrypoint copies rather than moves it — and individual variables are layered on top of either. Nothing is written when the environment supplies no configuration at all and the agent is not yet provisioned; the container stops with an explanation instead of starting an agent that cannot think.
+
+Provisioning happens once. On every later start the entrypoint finds `config.json` in the state directory and leaves the agent's own credentials, routes, proxy, and relays untouched, including the ones it configured for itself with its tools. `ROGUE_REPROVISION=1` re-applies the environment on the next start; a fresh container with a fresh volume is otherwise the way to change a Rogue's provisioning.
+
+The compose file keeps identity, credentials, memory, transcript, and everything the agent writes in the named volume `rogue-agent` mounted at `/home/rogue/agent`, which is also the working directory of the agent's coding tools. Removing that volume destroys the Rogue permanently — its immutable identity and Nostr key live nowhere else. A second independent agent is `docker compose -p rogue-2 up -d`, which gets its own volume and its own identity. The process restarts unless explicitly stopped, and a stop is given 60 seconds so the current wake cycle can finish.
+
+Interactive flows still work when a terminal is attached: `docker compose run --rm -it rogue --auth` opens the full provider, OAuth, and model interface against the same volume, and `docker compose run --rm -it rogue --interactive` opens the supervised chat. The read-only transcript viewer binds inside the container and no port is published; reach it with `docker compose exec` or read the logs.
+
+The container is the isolation boundary, not a sandbox the agent respects: it runs as an unprivileged user, but it has the network, filesystem, and tooling the image gives it, and it is not restricted from anything it can reach. Give it its own volume, its own credentials, and its own network exposure, and trim the package list in the `Dockerfile` to narrow it further. Values in `.env` are readable through `docker inspect` and the process environment; a mounted `initial_auth.json` referenced by `ROGUE_INITIAL_AUTH_FILE` keeps keys out of both, and Rogue deletes the file after importing it.
 
 ## Development
 

@@ -1,0 +1,21 @@
+# The image needs dist/rogue.js and docker/entrypoint.sh; everything else is
+# build-context weight, private state, or a secret.
+.git
+.gitignore
+.rogue
+node_modules
+src
+test
+scripts
+package.json
+package-lock.json
+tsconfig.json
+vitest.config.ts
+AGENTS.md
+README.md
+prompt.md
+.env
+.env.*
+initial_auth.json
+*.zip
+*.log

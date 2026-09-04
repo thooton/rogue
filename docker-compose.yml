@@ -1,0 +1,30 @@
+services:
+  rogue:
+    build:
+      context: .
+      args:
+        # Match a host user when the workspace below is a bind mount.
+        ROGUE_UID: "1000"
+        ROGUE_GID: "1000"
+    image: rogue:latest
+    # Rogue runs terminal commands; PID 1 needs to reap their children.
+    init: true
+    restart: unless-stopped
+    # An autonomous cycle is given time to finish before the process is killed.
+    stop_grace_period: 60s
+    env_file:
+      - .env
+    volumes:
+      # Identity, credentials, memory, transcript, and everything the agent
+      # writes for itself. Delete this volume and the Rogue is gone.
+      - rogue-agent:/home/rogue/agent
+      # For credentials you would rather not put in .env, mount a file instead
+      # and set ROGUE_INITIAL_AUTH_FILE to this path:
+      # - ./initial_auth.json:/run/secrets/initial_auth.json:ro
+    extra_hosts:
+      # Lets ROGUE_CUSTOM_PROVIDER_URL reach a model server running on the host,
+      # e.g. http://host.docker.internal:11434/v1 for Ollama.
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  rogue-agent:
