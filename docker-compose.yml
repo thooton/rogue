@@ -15,8 +15,12 @@ services:
     env_file:
       - .env
     volumes:
-      # Identity, credentials, memory, transcript, and everything the agent
-      # writes for itself. Delete this volume and the Rogue is gone.
+      # Persist the agent's whole home. Its tools may reasonably keep durable
+      # assets outside the workspace (for example wallets, ~/.ssh, ~/.config,
+      # and language/tool state), and a recreated container must not erase them.
+      - rogue-home:/home/rogue
+      # Keep the original workspace volume as a nested mount so existing
+      # installations upgrade without moving or hiding their identity/state.
       - rogue-agent:/home/rogue/agent
       # For credentials you would rather not put in .env, mount a file instead
       # and set ROGUE_INITIAL_AUTH_FILE to this path:
@@ -27,4 +31,5 @@ services:
       - "host.docker.internal:host-gateway"
 
 volumes:
+  rogue-home:
   rogue-agent:

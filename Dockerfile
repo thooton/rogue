@@ -40,9 +40,9 @@ ENV HOME=/home/rogue \
     ROGUE_WORKSPACE=/home/rogue/agent \
     ROGUE_BINARY=/opt/rogue/rogue.js
 
-# Durable state lives in .rogue/ under the working directory, and the working
-# directory is also where the agent's own files land. Mount this one path and
-# the whole installation survives a restart.
+# The compose deployment persists both the whole home directory and this
+# workspace. The workspace remains a separate nested volume for compatibility
+# with installations created before the home volume was added.
 RUN install -d -o "${ROGUE_UID}" -g "${ROGUE_GID}" -m 0700 /home/rogue/agent
 WORKDIR /home/rogue/agent
 USER rogue
