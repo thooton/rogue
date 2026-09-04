@@ -611,8 +611,16 @@ export function createRogueTools(store: RogueStore, options: RogueToolOptions = 
         until: params.until,
         limit: params.limit ?? 20,
       });
-      const result = { count: page.events.length, nextUntil: page.nextUntil, events: page.events };
-      return textResult(page.events.length ? JSON.stringify(result, null, 2) : "No matching events.", result);
+      const result = {
+        count: page.events.length,
+        nextUntil: page.nextUntil,
+        failures: page.failures,
+        events: page.events,
+      };
+      // "No matching events" from a partially refused read would be a claim
+      // about the network that the read never established.
+      if (page.events.length || page.failures) return textResult(JSON.stringify(result, null, 2), result);
+      return textResult("No matching events.", result);
     },
   });
 
@@ -673,8 +681,14 @@ export function createRogueTools(store: RogueStore, options: RogueToolOptions = 
         until: params.until,
         limit: params.limit ?? 20,
       });
-      const result = { count: page.messages.length, nextUntil: page.nextUntil, messages: page.messages };
-      return textResult(page.messages.length ? JSON.stringify(result, null, 2) : "No direct messages.", result);
+      const result = {
+        count: page.messages.length,
+        nextUntil: page.nextUntil,
+        failures: page.failures,
+        messages: page.messages,
+      };
+      if (page.messages.length || page.failures) return textResult(JSON.stringify(result, null, 2), result);
+      return textResult("No direct messages.", result);
     },
   });
 

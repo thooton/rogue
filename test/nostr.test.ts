@@ -35,8 +35,14 @@ interface TestRelay {
  * connect, refuses direct-message filters from anyone who has not authenticated,
  * and serves a gift wrap only to the key its `p` tag names. The real relay is a
  * separate Go service (../../rogue-relay) with its own tests.
+ *
+ * `refuse` stands in for every policy a real relay enforces that this one does
+ * not: return a reason and the subscription is closed with it and never served,
+ * which is how a relay says no to a filter.
  */
-async function startRelay(): Promise<TestRelay> {
+async function startRelay(
+  options: { refuse?: (filters: Filter[]) => string | undefined } = {},
+): Promise<TestRelay> {
   const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
   const events: Event[] = [];
 
@@ -68,6 +74,12 @@ async function startRelay(): Promise<TestRelay> {
       const subscriptionId = String(message[1]);
       const filters = message.slice(2) as Filter[];
 
+      const refusal = options.refuse?.(filters);
+      if (refusal !== undefined) {
+        socket.send(JSON.stringify(["CLOSED", subscriptionId, refusal]));
+        return;
+      }
+
       const reachesDirectMessages = filters.some((filter) => (filter.kinds ?? []).some(isDirectMessageKind));
       if (reachesDirectMessages && !authed) {
         socket.send(JSON.stringify(["CLOSED", subscriptionId, "auth-required: authenticate to read direct messages"]));
@@ -95,10 +107,10 @@ async function startRelay(): Promise<TestRelay> {
   };
 }
 
-async function newService(relay: TestRelay): Promise<NostrService> {
+async function newService(...relays: TestRelay[]): Promise<NostrService> {
   const directory = await mkdtemp(path.join(tmpdir(), "rogue-nostr-"));
   const nostr = new NostrService(directory, { defaultRelays: [] });
-  await nostr.addRelay(relay.url);
+  for (const relay of relays) await nostr.addRelay(relay.url);
   return nostr;
 }
 
@@ -166,6 +178,54 @@ describe("reading public events", () => {
       expect(last.events.map((event) => event.content)).toEqual(["post 0"]);
       // Nothing older, so the walk ends here.
       expect(last.nextUntil).toBeUndefined();
+    } finally {
+      await relay.close();
+    }
+  });
+
+  it("reports a refused read rather than reporting a silent network", async () => {
+    const refusal = "blocked: can't handle empty filters";
+    const relay = await startRelay({ refuse: () => refusal });
+    const nostr = await newService(relay);
+    relay.seed(post(generateSecretKey(), "a post the relay would not hand over", 1_000));
+
+    try {
+      // The failure this guards against is the opposite of a throw: resolving
+      // with an empty page tells an agent the network is quiet when in fact it
+      // was never asked, and an agent told its network is quiet stops looking.
+      await expect(nostr.read({ kinds: [1], limit: 20 })).rejects.toThrow(refusal);
+      await expect(nostr.read({ kinds: [1], limit: 20 })).rejects.toThrow(relay.url);
+    } finally {
+      await relay.close();
+    }
+  });
+
+  it("serves what one relay answered and names the one that refused", async () => {
+    const answering = await startRelay();
+    const refusing = await startRelay({ refuse: () => "rate-limited: too many filters" });
+    const nostr = await newService(answering, refusing);
+    answering.seed(post(generateSecretKey(), "the one post that was served", 1_000));
+
+    try {
+      const page = await nostr.read({ kinds: [1], limit: 20 });
+      expect(page.events.map((event) => event.content)).toEqual(["the one post that was served"]);
+      // A partial page is still a page, but the caller must be able to tell it
+      // apart from a complete one.
+      expect(page.failures).toEqual([{ relay: `${refusing.url}/`, reason: "rate-limited: too many filters" }]);
+    } finally {
+      await answering.close();
+      await refusing.close();
+    }
+  });
+
+  it("reports an empty page from a relay that answered as empty, not as a failure", async () => {
+    const relay = await startRelay();
+    const nostr = await newService(relay);
+
+    try {
+      const page = await nostr.read({ kinds: [1], limit: 20 });
+      expect(page.events).toEqual([]);
+      expect(page.failures).toBeUndefined();
     } finally {
       await relay.close();
     }

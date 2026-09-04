@@ -30,6 +30,19 @@ export const DEFAULT_RELAYS = ["wss://relay.roguenetwork.org"];
 // with whatever it has.
 const RELAY_TIMEOUT_MS = 8_000;
 
+// The reason nostr-tools closes a subscription with once the relay has answered
+// the filter and reached the end of its stored events. Every other reason — a
+// `blocked:`/`restricted:`/`rate-limited:` refusal, a NIP-42 challenge that
+// went unanswered, a connection that never opened — means the relay did not
+// answer, which is not the same thing as answering with nothing.
+const EOSE_CLOSE_REASON = "closed automatically on eose";
+
+/** A relay that did not answer a read, and what it said instead. */
+export interface RelayFailure {
+  relay: string;
+  reason: string;
+}
+
 /** One page of a backwards walk through a relay's stored events. */
 export interface EventPage {
   events: Event[];
@@ -38,6 +51,12 @@ export interface EventPage {
    * relays had nothing older.
    */
   nextUntil?: number;
+  /**
+   * Relays that refused or failed this read while at least one other answered.
+   * The page is real but partial, and a caller that reports "nothing found"
+   * without mentioning these is guessing.
+   */
+  failures?: RelayFailure[];
 }
 
 /** One page of decrypted direct messages. */
@@ -49,6 +68,31 @@ export interface DirectMessagePage {
    * messages on the page. It is the only thing a relay can page by.
    */
   nextUntil?: number;
+  /** Relays that refused or failed this read. See {@link EventPage.failures}. */
+  failures?: RelayFailure[];
+}
+
+/** What one relay returned for a filter, or why it returned nothing. */
+interface QueryOutcome {
+  events: Event[];
+  failures: RelayFailure[];
+  /** How many relays answered the filter and reached end of stored events. */
+  answered: number;
+}
+
+/**
+ * Turn a read that every relay refused into an error.
+ *
+ * Resolving these with an empty list is indistinguishable from a quiet network,
+ * and a Rogue told its network is quiet stops looking. The refusal reasons are
+ * carried into the message because they are the whole diagnosis: a relay that
+ * says `blocked: can't handle empty filters` has told the caller exactly what
+ * to fix.
+ */
+function assertAnyRelayAnswered(outcome: QueryOutcome, purpose: string): void {
+  if (outcome.answered > 0 || outcome.failures.length === 0) return;
+  const detail = outcome.failures.map((failure) => `${failure.relay}: ${failure.reason}`).join("; ");
+  throw new Error(`No relay answered the ${purpose}. ${detail}`);
 }
 
 function normalizeRelay(value: string): string {
@@ -138,18 +182,32 @@ export class NostrService {
    * This is `pool.querySync` with a challenge handler attached: on a
    * `auth-required:` refusal the pool authenticates and re-subscribes, so an
    * access-controlled read costs one extra round trip rather than failing.
+   *
+   * Unlike `querySync` it reports which relays declined to answer. A relay
+   * closes a subscription it will not serve, and treating that close as the
+   * ordinary end of a stream turns every refusal into an empty page.
    */
-  private async query(pool: SimplePool, relays: string[], filter: Filter): Promise<Event[]> {
+  private async query(pool: SimplePool, relays: string[], filter: Filter): Promise<QueryOutcome> {
     const onauth = await this.authenticator();
     return new Promise((resolve) => {
       const events: Event[] = [];
+      let settled = false;
       pool.subscribeEose(relays, filter, {
         maxWait: RELAY_TIMEOUT_MS,
         onauth,
         onevent: (event) => {
           events.push(event);
         },
-        onclose: () => resolve(events),
+        onclose: (closes) => {
+          // Every relay has now finished one way or the other. A second call
+          // would be a repeat of that, and the first reasons are the true ones.
+          if (settled) return;
+          settled = true;
+          const failures = closes
+            .filter((close) => close.reason !== EOSE_CLOSE_REASON)
+            .map((close) => ({ relay: close.url, reason: close.reason }));
+          resolve({ events, failures, answered: closes.length - failures.length });
+        },
       });
     });
   }
@@ -205,7 +263,9 @@ export class NostrService {
     const pool = new SimplePool({ enableReconnect: false });
     try {
       const limit = Math.min(filter.limit ?? 20, 100);
-      const received = uniqueById(await this.query(pool, relays, { ...filter, limit }));
+      const outcome = await this.query(pool, relays, { ...filter, limit });
+      assertAnyRelayAnswered(outcome, "read");
+      const received = uniqueById(outcome.events);
       // The cursor counts everything the relays handed over, including what is
       // discarded below: the walk has passed those events either way.
       const nextUntil = nextCursor(received, limit);
@@ -214,7 +274,7 @@ export class NostrService {
       const events = newestFirst(received)
         .filter((event) => networkCharacterCount(event.content) <= networkCharacterLimit(event.kind))
         .slice(0, limit);
-      return { events, nextUntil };
+      return { events, nextUntil, ...(outcome.failures.length ? { failures: outcome.failures } : {}) };
     } finally {
       pool.destroy();
     }
@@ -268,19 +328,27 @@ export class NostrService {
     const pool = new SimplePool({ enableReconnect: false });
     try {
       const limit = Math.min(options.limit ?? 20, 100);
-      const wraps = uniqueById(await this.query(pool, relays, {
+      const outcome = await this.query(pool, relays, {
         kinds: [GIFT_WRAP_KIND],
         "#p": [getPublicKey(secret)],
         until: options.until,
         since: options.since,
         limit,
-      }));
+      });
+      // A relay that would not serve these has hidden the agent's mail from it,
+      // which must not read back as an empty inbox.
+      assertAnyRelayAnswered(outcome, "direct-message read");
+      const wraps = uniqueById(outcome.events);
       const messages = newestMessagesFirst(uniqueById(
         wraps
           .map((wrap) => unwrapDirectMessage(wrap, secret))
           .filter((message): message is DirectMessage => message !== undefined),
       ));
-      return { messages, nextUntil: nextCursor(wraps, limit) };
+      return {
+        messages,
+        nextUntil: nextCursor(wraps, limit),
+        ...(outcome.failures.length ? { failures: outcome.failures } : {}),
+      };
     } finally {
       pool.destroy();
     }
