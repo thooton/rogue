@@ -16,8 +16,8 @@ import type {
 const OPENCODE_PROVIDER = "opencode";
 const OPENCODE_API_KEY_ENV = "OPENCODE_API_KEY";
 const ANONYMOUS_API_KEY = "opencode-free";
-const FALLBACK_PROJECT_ID = randomUUID();
-const FALLBACK_SESSION_ID = randomUUID();
+let fallbackIdentity = { projectId: randomUUID(), sessionId: randomUUID() };
+const identityGenerations = new Map<string, number>();
 
 /** OpenCode advertises promotional/free models with zero prices in its catalog. */
 export function isFreeOpenCodeModel(model: Model<Api>): boolean {
@@ -28,8 +28,8 @@ export function isFreeOpenCodeModel(model: Model<Api>): boolean {
 
 /**
  * Produce an RFC 4122-shaped, deterministic identifier without exposing the
- * Rogue profile ID itself to the provider. Keeping this derived from Pi's
- * durable session key preserves affinity across process restarts.
+ * Rogue profile ID itself to the provider. Keeping the initial identity
+ * derived from Pi's durable session key preserves affinity across restarts.
  */
 function stableUUID(value: string): string {
   const bytes = createHash("sha256").update(value).digest().subarray(0, 16);
@@ -45,8 +45,10 @@ function stableUUID(value: string): string {
  * this inference call. Callers without a session key share process-local IDs.
  */
 export function openCodeFreeHeaders(sessionId?: string): ProviderHeaders {
-  const projectId = sessionId ? stableUUID(`rogue:opencode:project:${sessionId}`) : FALLBACK_PROJECT_ID;
-  const openCodeSessionId = sessionId ? stableUUID(`rogue:opencode:session:${sessionId}`) : FALLBACK_SESSION_ID;
+  const generation = sessionId ? (identityGenerations.get(sessionId) ?? 0) : 0;
+  const identityKey = generation ? `${sessionId}:generation:${generation}` : sessionId;
+  const projectId = identityKey ? stableUUID(`rogue:opencode:project:${identityKey}`) : fallbackIdentity.projectId;
+  const openCodeSessionId = identityKey ? stableUUID(`rogue:opencode:session:${identityKey}`) : fallbackIdentity.sessionId;
   return {
     Authorization: null,
     "X-Api-Key": null,
@@ -56,6 +58,20 @@ export function openCodeFreeHeaders(sessionId?: string): ProviderHeaders {
     "x-opencode-request": randomUUID(),
     "x-opencode-client": "opencode",
   };
+}
+
+/**
+ * Replace every anonymous OpenCode affinity identifier after the provider has
+ * rate-limited the current identity. The next request also gets its usual new
+ * request UUID, so it is unrelated to the rejected request at every identity
+ * layer OpenCode exposes.
+ */
+export function rotateOpenCodeFreeIdentity(sessionId?: string): void {
+  if (!sessionId) {
+    fallbackIdentity = { projectId: randomUUID(), sessionId: randomUUID() };
+    return;
+  }
+  identityGenerations.set(sessionId, (identityGenerations.get(sessionId) ?? 0) + 1);
 }
 
 function mergeHeaders(base: ProviderHeaders | undefined, override: ProviderHeaders): ProviderHeaders {

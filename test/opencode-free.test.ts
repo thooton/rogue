@@ -6,7 +6,7 @@ import { describe, expect, it } from "vitest";
 import { RogueConfigStore } from "../src/config.js";
 import { FileCredentialStore } from "../src/credentials.js";
 import { importInitialAuthentication } from "../src/initial-auth.js";
-import { isFreeOpenCodeModel, openCodeFreeHeaders } from "../src/opencode-free.js";
+import { isFreeOpenCodeModel, openCodeFreeHeaders, rotateOpenCodeFreeIdentity } from "../src/opencode-free.js";
 import { createRogueModels } from "../src/provider-runtime.js";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[45][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -120,5 +120,21 @@ describe("OpenCode free models", () => {
     expect(second["x-opencode-request"]).not.toBe(first["x-opencode-request"]);
     expect(other["x-opencode-project"]).not.toBe(first["x-opencode-project"]);
     expect(other["x-opencode-session"]).not.toBe(first["x-opencode-session"]);
+  });
+
+  it("rotates the complete OpenCode identity while retaining the new identity for later calls", () => {
+    const sessionId = `rogue-rate-limited-${crypto.randomUUID()}`;
+    const first = openCodeFreeHeaders(sessionId);
+
+    rotateOpenCodeFreeIdentity(sessionId);
+    const rotated = openCodeFreeHeaders(sessionId);
+    const retained = openCodeFreeHeaders(sessionId);
+
+    expect(rotated["x-opencode-project"]).not.toBe(first["x-opencode-project"]);
+    expect(rotated["x-opencode-session"]).not.toBe(first["x-opencode-session"]);
+    expect(rotated["x-opencode-request"]).not.toBe(first["x-opencode-request"]);
+    expect(retained["x-opencode-project"]).toBe(rotated["x-opencode-project"]);
+    expect(retained["x-opencode-session"]).toBe(rotated["x-opencode-session"]);
+    expect(retained["x-opencode-request"]).not.toBe(rotated["x-opencode-request"]);
   });
 });

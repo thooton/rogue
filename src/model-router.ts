@@ -11,6 +11,7 @@ import {
 } from "@earendil-works/pi-ai";
 import type { RogueConfigStore } from "./config.js";
 import { httpProxyProviderEnv, isHttpProxyActive } from "./http-proxy.js";
+import { rotateOpenCodeFreeIdentity } from "./opencode-free.js";
 
 /**
  * Prompt cache retention requested for every agent request.
@@ -27,6 +28,7 @@ import { httpProxyProviderEnv, isHttpProxyActive } from "./http-proxy.js";
 export const DEFAULT_CACHE_RETENTION: CacheRetention = "long";
 
 const RECOVERABLE = /credit|quota|billing|payment|402|429|rate.?limit|overload|unavailable|timeout|timed out|network|fetch failed|authentication|api.?key|token expired/i;
+const HTTP_RATE_LIMIT = /\b429\b/;
 const PROXY_CONNECTION_FAILURE = /\b(?:ECONNRESET|ECONNREFUSED|ECONNABORTED|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|EPIPE|UND_ERR_(?:CONNECT_TIMEOUT|HEADERS_TIMEOUT|BODY_TIMEOUT|SOCKET|DESTROYED|CLOSED))\b|fetch failed|network ?(?:error|failure)|network request failed|socket (?:hang up|closed|disconnected|error)|connection (?:error|failure|reset|refused|closed|terminated|timed out)|connect error|(?:could not|failed to) connect|other side closed|disconnected before secure TLS|\b(?:headers |body )?timeout\b|timed out/i;
 const PROXY_CONNECTION_RETRIES = 5;
 
@@ -150,6 +152,12 @@ export function createFailoverStream(options: {
           return;
         }
         const reason = terminal.error.errorMessage ?? "provider request failed";
+        if (model.provider === "opencode" && HTTP_RATE_LIMIT.test(reason)) {
+          // OpenCode's anonymous free tier associates limits with its project
+          // and session headers. Rotate both before attempting an OpenCode
+          // fallback (or before the next turn when no fallback remains).
+          rotateOpenCodeFreeIdentity(streamOptions?.sessionId);
+        }
         attempts.push({ route: describe(model), reason });
         const next = candidates[index + 1];
         if (!next || terminal.reason === "aborted" || !RECOVERABLE.test(reason)) {

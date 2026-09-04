@@ -21,6 +21,7 @@ import { startIntrospectionServer } from "../src/introspection.js";
 import { RogueConfigStore } from "../src/config.js";
 import * as ui from "../src/ui.js";
 import { createFailoverStream, DEFAULT_CACHE_RETENTION } from "../src/model-router.js";
+import { openCodeFreeHeaders } from "../src/opencode-free.js";
 import { addCacheUsage, cacheHitRate, emptyCacheUsage, formatCacheUsage } from "../src/cache-usage.js";
 import {
   createAssistantMessageEventStream,
@@ -28,6 +29,7 @@ import {
   type AssistantMessage,
   type Model,
   type Models,
+  type ProviderHeaders,
   type SimpleStreamOptions,
   type Usage,
 } from "@earendil-works/pi-ai";
@@ -355,6 +357,47 @@ describe("provider configuration", () => {
     expect(context.messages).toHaveLength(1);
     expect(JSON.stringify(context.messages[0])).toContain("falling back to backup/two");
     expect((await config.recentFailovers())[0]).toMatchObject({ from: "primary/one", to: "backup/two" });
+  });
+
+  it("uses a new anonymous OpenCode identity for the fallback after a 429", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "rogue-opencode-429-test-"));
+    const config = new RogueConfigStore(directory);
+    await config.configureProvider({ provider: "opencode", model: "fallback", priority: 10 });
+    const primary = { provider: "opencode", id: "primary" } as Model<Api>;
+    const fallback = { provider: "opencode", id: "fallback" } as Model<Api>;
+    const message = (model: Model<Api>, stopReason: "stop" | "error", errorMessage?: string): AssistantMessage => ({
+      role: "assistant", content: [], api: "openai-completions", provider: model.provider, model: model.id,
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+      stopReason, errorMessage, timestamp: Date.now(),
+    });
+    const seen: ProviderHeaders[] = [];
+    const models = {
+      getModel: (_provider: string, modelId: string) => modelId === "fallback" ? fallback : primary,
+      streamSimple: (model: Model<Api>, _context: unknown, streamOptions?: SimpleStreamOptions) => {
+        seen.push(openCodeFreeHeaders(streamOptions?.sessionId));
+        const stream = createAssistantMessageEventStream();
+        queueMicrotask(() => {
+          if (model.id === "primary") {
+            stream.push({ type: "error", reason: "error", error: message(model, "error", "429: Rate limit exceeded") });
+          } else {
+            stream.push({ type: "done", reason: "stop", message: message(model, "stop") });
+          }
+        });
+        return stream;
+      },
+    } as unknown as Models;
+    const sessionId = `rogue-opencode-429-${crypto.randomUUID()}`;
+
+    for await (const _event of createFailoverStream({ models, config, primary })(
+      primary,
+      { messages: [] },
+      { sessionId },
+    )) { /* consume */ }
+
+    expect(seen).toHaveLength(2);
+    expect(seen[1]!["x-opencode-project"]).not.toBe(seen[0]!["x-opencode-project"]);
+    expect(seen[1]!["x-opencode-session"]).not.toBe(seen[0]!["x-opencode-session"]);
+    expect(seen[1]!["x-opencode-request"]).not.toBe(seen[0]!["x-opencode-request"]);
   });
 
   it("reports every failed route and can pin the selected one", async () => {
