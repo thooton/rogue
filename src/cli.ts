@@ -22,6 +22,13 @@ import { importInitialAuthentication } from "./initial-auth.js";
 import * as ui from "./ui.js";
 import type { CacheRetention } from "@earendil-works/pi-ai";
 import { DEFAULT_CACHE_RETENTION } from "./model-router.js";
+import {
+  applyHttpProxy,
+  httpProxyStatus,
+  normalizeHttpProxySettings,
+  redactHttpProxyUrl,
+  type HttpProxySettings,
+} from "./http-proxy.js";
 
 interface CliOptions {
   provider?: string;
@@ -153,7 +160,7 @@ export function parseArgs(args: string[]): CliOptions {
   return options;
 }
 
-const SETUP_STEPS = ["Identity", "Model", "Network"] as const;
+const SETUP_STEPS = ["Identity", "HTTP proxy", "Model", "Network"] as const;
 
 function candidateChoice(candidate: ProfileCandidate, index: number): ui.SelectItem {
   const { fourFactors: factors, typeCode, typeTitle } = candidate.personality;
@@ -218,7 +225,7 @@ async function configureInitialRelays(options: CliOptions): Promise<void> {
   if (!stdin.isTTY || options.autoSelectPersona) return;
   const nostr = new NostrService(options.stateDirectory ?? ".rogue");
   let relays = await nostr.listRelays();
-  ui.steps(SETUP_STEPS, 2);
+  ui.steps(SETUP_STEPS, 3);
   ui.heading("Rogue Network", "The public Rogue Network relay is included by default. Add more ws:// or wss:// relay URLs, or press Enter to skip.");
   ui.hint(`Already configured (${relays.length}):`);
   ui.chips(relays);
@@ -238,6 +245,49 @@ async function configureInitialRelays(options: CliOptions): Promise<void> {
   ui.write();
 }
 
+async function configureInitialHttpProxy(options: CliOptions): Promise<void> {
+  if (!stdin.isTTY || options.autoSelectPersona) return;
+  const config = new RogueConfigStore(options.stateDirectory ?? ".rogue");
+  const stored = await config.getHttpProxy();
+  const current = httpProxyStatus(stored);
+  ui.steps(SETUP_STEPS, 1);
+  ui.heading(
+    "HTTP proxy",
+    "Optionally route model-provider and other outbound HTTP(S) requests through a forward proxy.",
+  );
+  if (current.source === "stored") ui.info(`Stored proxy: ${current.httpsProxy}`);
+  else if (current.source === "environment") ui.info("Standard HTTP_PROXY/HTTPS_PROXY environment settings were detected and are already active.");
+  else ui.hint("No proxy is currently configured; outbound HTTP access is direct.");
+  const configure = await ui.confirm(stored ? "Replace the stored HTTP proxy?" : "Store a dedicated HTTP proxy for Rogue?", false);
+  if (!configure) {
+    ui.write();
+    return;
+  }
+
+  let settings: HttpProxySettings;
+  while (true) {
+    const proxyUrl = await ui.secret("Proxy URL, including credentials if required");
+    const noProxy = await ui.text({
+      label: "Direct-access hosts",
+      placeholder: "(optional, comma-separated NO_PROXY patterns)",
+      allowEmpty: true,
+    });
+    try {
+      settings = normalizeHttpProxySettings({ url: proxyUrl, noProxy: noProxy || undefined });
+      break;
+    } catch (error) {
+      ui.fail(error instanceof Error ? error.message : String(error));
+    }
+  }
+  await config.configureHttpProxy(settings);
+  await applyHttpProxy(settings);
+  ui.panel("HTTP proxy saved", [
+    ["Proxy", redactHttpProxyUrl(settings.url)],
+    ["Bypass", settings.noProxy ?? ui.style.faint("none")],
+    ["Storage", `${config.path} ${ui.style.faint("(owner-only)")}`],
+  ]);
+}
+
 async function ensureModelProvider(options: CliOptions, firstRun: boolean): Promise<void> {
   const stateDirectory = options.stateDirectory ?? ".rogue";
   const config = new RogueConfigStore(stateDirectory);
@@ -245,7 +295,7 @@ async function ensureModelProvider(options: CliOptions, firstRun: boolean): Prom
   if (!stdin.isTTY) {
     throw new Error("No model provider is configured. Run Rogue in an interactive terminal to complete first-run setup, or run --auth first.");
   }
-  if (firstRun) ui.steps(SETUP_STEPS, 1);
+  if (firstRun) ui.steps(SETUP_STEPS, 2);
   await runProviderSetup({
     stateDirectory,
     provider: options.provider,
@@ -290,6 +340,7 @@ async function main(): Promise<void> {
     }
   }
   const firstRun = await ensureActiveProfile(options);
+  if (firstRun) await configureInitialHttpProxy(options);
   await ensureModelProvider(options, firstRun);
   if (firstRun) await configureInitialRelays(options);
   if (options.freshSession) await new SessionStore(options.stateDirectory ?? ".rogue").clear();

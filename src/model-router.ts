@@ -10,6 +10,7 @@ import {
   type Api,
 } from "@earendil-works/pi-ai";
 import type { RogueConfigStore } from "./config.js";
+import { httpProxyProviderEnv, isHttpProxyActive } from "./http-proxy.js";
 
 /**
  * Prompt cache retention requested for every agent request.
@@ -26,6 +27,8 @@ import type { RogueConfigStore } from "./config.js";
 export const DEFAULT_CACHE_RETENTION: CacheRetention = "long";
 
 const RECOVERABLE = /credit|quota|billing|payment|402|429|rate.?limit|overload|unavailable|timeout|timed out|network|fetch failed|authentication|api.?key|token expired/i;
+const PROXY_CONNECTION_FAILURE = /\b(?:ECONNRESET|ECONNREFUSED|ECONNABORTED|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|EPIPE|UND_ERR_(?:CONNECT_TIMEOUT|HEADERS_TIMEOUT|BODY_TIMEOUT|SOCKET|DESTROYED|CLOSED))\b|fetch failed|network ?(?:error|failure)|network request failed|socket (?:hang up|closed|disconnected|error)|connection (?:error|failure|reset|refused|closed|terminated|timed out)|connect error|(?:could not|failed to) connect|other side closed|disconnected before secure TLS|\b(?:headers |body )?timeout\b|timed out/i;
+const PROXY_CONNECTION_RETRIES = 5;
 
 export interface ModelFailoverNotice {
   from: string;
@@ -105,17 +108,43 @@ export function createFailoverStream(options: {
       const attempts: ModelRouteAttempt[] = [];
       for (let index = 0; index < candidates.length; index += 1) {
         const model = candidates[index]!;
-        const buffered: AssistantMessageEvent[] = [];
-        // Every agent request funnels through here, so this is the one place
-        // that has to ask for caching. An explicit caller preference wins; the
-        // agent loop never sets one, which is why Pi's "short" default would
-        // otherwise apply to every request a Rogue makes.
-        const source = options.models.streamSimple(model, context, {
-          ...streamOptions,
-          cacheRetention: streamOptions?.cacheRetention ?? cacheRetention,
-        });
-        for await (const event of source) buffered.push(event);
-        const terminal = buffered.at(-1);
+        let buffered: AssistantMessageEvent[] = [];
+        let terminal: AssistantMessageEvent | undefined;
+        let proxyRetries = 0;
+        while (true) {
+          buffered = [];
+          // Every agent request funnels through here, so this is the one place
+          // that has to ask for caching. An explicit caller preference wins; the
+          // agent loop never sets one, which is why Pi's "short" default would
+          // otherwise apply to every request a Rogue makes.
+          try {
+            const source = options.models.streamSimple(model, context, {
+              ...streamOptions,
+              cacheRetention: streamOptions?.cacheRetention ?? cacheRetention,
+              env: { ...httpProxyProviderEnv(), ...streamOptions?.env },
+            });
+            for await (const event of source) buffered.push(event);
+            terminal = buffered.at(-1);
+          } catch (error) {
+            const reason = error instanceof Error ? error.message : String(error);
+            terminal = {
+              type: "error",
+              reason: streamOptions?.signal?.aborted ? "aborted" : "error",
+              error: setupErrorMessage(model, reason),
+            };
+            buffered.push(terminal);
+          }
+          if (terminal?.type !== "error") break;
+          const retryReason = terminal.error.errorMessage ?? "provider request failed";
+          if (terminal.reason === "aborted"
+            || streamOptions?.signal?.aborted
+            || !isHttpProxyActive()
+            || !PROXY_CONNECTION_FAILURE.test(retryReason)
+            || proxyRetries >= PROXY_CONNECTION_RETRIES) break;
+          // Proxy failures are often transient. Keep failed events private and
+          // retry immediately; only the exhausted attempt reaches failover.
+          proxyRetries += 1;
+        }
         if (terminal?.type !== "error") {
           for (const event of buffered) output.push(event);
           return;

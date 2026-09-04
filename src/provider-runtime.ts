@@ -7,6 +7,9 @@ import { createCodingTools, createFindTool, createGrepTool, createLsTool } from 
 import { FileCredentialStore } from "./credentials.js";
 import { FileModelsStore } from "./model-catalog-store.js";
 import { CustomProviderStore, registerCustomProviders } from "./custom-providers.js";
+import { enableOpenCodeFreeModels } from "./opencode-free.js";
+import { RogueConfigStore } from "./config.js";
+import { applyHttpProxy } from "./http-proxy.js";
 
 let initialized = false;
 
@@ -33,9 +36,12 @@ export interface RogueModelRuntime {
  */
 export async function createRogueModels(stateDirectory: string): Promise<RogueModelRuntime> {
   initializeBundledProviderRuntime();
+  const config = new RogueConfigStore(stateDirectory);
+  await applyHttpProxy(await config.getHttpProxy());
   const credentials = new FileCredentialStore(`${stateDirectory}/auth.json`);
   const modelsStore = new FileModelsStore(`${stateDirectory}/model-catalogs.json`);
   const models = builtinModels({ credentials, modelsStore });
+  enableOpenCodeFreeModels(models);
   const customProviders = new CustomProviderStore(stateDirectory);
   await registerCustomProviders(models, customProviders);
   return { models, credentials, modelsStore, customProviders };

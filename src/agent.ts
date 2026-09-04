@@ -108,13 +108,19 @@ export async function createRogueAgent(options: RogueAgentOptions = {}): Promise
     // at a cold cache and paid to rewrite a prefix the provider still had.
     sessionId: `rogue-${profile.id}`,
     afterToolCall: async ({ toolCall, context }) => {
-      if (!("apiKey" in toolCall.arguments)) return undefined;
+      const hasApiKey = "apiKey" in toolCall.arguments;
+      const hasProxyUrl = toolCall.name === "configure_http_proxy" && "proxyUrl" in toolCall.arguments;
+      if (!hasApiKey && !hasProxyUrl) return undefined;
       // Scrub the secret before Pi's automatic follow-up turn reuses this transcript.
       for (const message of context.messages) {
         if (message.role !== "assistant") continue;
         for (const block of message.content) {
           if (block.type === "toolCall" && block.id === toolCall.id) {
-            block.arguments = { ...block.arguments, apiKey: "<redacted>" };
+            block.arguments = {
+              ...block.arguments,
+              ...(hasApiKey ? { apiKey: "<redacted>" } : {}),
+              ...(hasProxyUrl ? { proxyUrl: "<redacted>" } : {}),
+            };
           }
         }
       }

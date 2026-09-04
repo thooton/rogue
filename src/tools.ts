@@ -18,6 +18,11 @@ import {
   type CustomProviderStore,
 } from "./custom-providers.js";
 import { ROGUE_DIRECT_CHARACTER_LIMIT, ROGUE_PUBLIC_CHARACTER_LIMIT } from "./network-policy.js";
+import {
+  applyHttpProxy,
+  httpProxyStatus,
+  normalizeHttpProxySettings,
+} from "./http-proxy.js";
 
 function textResult(text: string, details: unknown = {}) {
   return { content: [{ type: "text" as const, text }], details };
@@ -257,6 +262,57 @@ export function createRogueTools(store: RogueStore, options: RogueToolOptions = 
     },
   });
 
+  const getHttpProxy = defineTool({
+    name: "get_http_proxy",
+    label: "Get HTTP proxy",
+    description: "Inspect outbound HTTP proxy routing. Embedded proxy credentials are always redacted.",
+    parameters: Type.Object({}),
+    async execute(_id, _params, signal) {
+      ensureActive(signal);
+      if (!options.config) throw new Error("HTTP proxy configuration is unavailable.");
+      const status = httpProxyStatus(await options.config.getHttpProxy());
+      return textResult(JSON.stringify(status, null, 2), status);
+    },
+  });
+
+  const configureHttpProxy = defineTool({
+    name: "configure_http_proxy",
+    label: "Configure HTTP proxy",
+    description:
+      "Persist and immediately activate one HTTP or HTTPS forward proxy for outbound provider requests. The URL may contain basic-auth credentials; they are stored privately and never returned. Use noProxy for comma-separated hosts that should connect directly.",
+    parameters: Type.Object({
+      proxyUrl: Type.String({ minLength: 1, maxLength: 2048 }),
+      noProxy: Type.Optional(Type.String({ minLength: 1, maxLength: 4000 })),
+    }),
+    executionMode: "sequential",
+    async execute(_id, params, signal) {
+      ensureActive(signal);
+      if (!options.config) throw new Error("HTTP proxy configuration is unavailable.");
+      const settings = normalizeHttpProxySettings({ url: params.proxyUrl, noProxy: params.noProxy });
+      await options.config.configureHttpProxy(settings);
+      const status = await applyHttpProxy(settings);
+      return textResult("HTTP proxy saved and activated for subsequent requests. Embedded credentials are redacted.", status);
+    },
+  });
+
+  const removeHttpProxy = defineTool({
+    name: "remove_http_proxy",
+    label: "Remove HTTP proxy",
+    description: "Remove Rogue's stored HTTP proxy and immediately return to standard proxy environment variables or direct access.",
+    parameters: Type.Object({}),
+    executionMode: "sequential",
+    async execute(_id, _params, signal) {
+      ensureActive(signal);
+      if (!options.config) throw new Error("HTTP proxy configuration is unavailable.");
+      await options.config.removeHttpProxy();
+      const status = await applyHttpProxy(undefined);
+      return textResult(
+        status.source === "environment" ? "Stored HTTP proxy removed; environment proxy settings are now active." : "Stored HTTP proxy removed; outbound HTTP access is now direct.",
+        status,
+      );
+    },
+  });
+
   const listModelProviders = defineTool({
     name: "list_model_providers",
     label: "List model providers",
@@ -271,7 +327,11 @@ export function createRogueTools(store: RogueStore, options: RogueToolOptions = 
         .map((provider) => ({
           id: provider.id,
           name: provider.name,
-          authentication: [provider.auth.oauth ? "oauth" : undefined, provider.auth.apiKey ? "api_key" : undefined].filter(Boolean),
+          authentication: [
+            provider.id === "opencode" ? "free_models_no_key" : undefined,
+            provider.auth.oauth ? "oauth" : undefined,
+            provider.auth.apiKey ? "api_key" : undefined,
+          ].filter(Boolean),
           // Only endpoints this installation registered itself carry a base
           // URL here; the built-in providers' own URLs are Pi's business.
           baseUrl: custom.get(provider.id)?.baseUrl,
@@ -345,7 +405,10 @@ export function createRogueTools(store: RogueStore, options: RogueToolOptions = 
     async execute(_id, params, signal) {
       ensureActive(signal);
       if (!options.models || !options.config) throw new Error("Provider configuration is unavailable.");
-      if (!options.models.getModel(params.provider, params.model)) throw new Error(`Unknown provider/model: ${params.provider}/${params.model}`);
+      const available = await options.models.getAvailable(params.provider, { signal });
+      if (!available.some((model) => model.id === params.model)) {
+        throw new Error(`Provider/model is unknown or unavailable with current authentication: ${params.provider}/${params.model}`);
+      }
       await options.config.configureProvider({ provider: params.provider, model: params.model, priority: params.priority });
       return textResult(`Configured ${params.provider}/${params.model} at priority ${params.priority}.`, await options.config.listProviders());
     },
@@ -627,6 +690,9 @@ export function createRogueTools(store: RogueStore, options: RogueToolOptions = 
     credentialStatus,
     setApiKey,
     removeCredential,
+    getHttpProxy,
+    configureHttpProxy,
+    removeHttpProxy,
     listModelProviders,
     listModels,
     configureModelProvider,

@@ -1,4 +1,4 @@
-const SECRET_KEY = /^(api_?key|secret|access_?token|refresh_?token|authorization)$/i;
+const SECRET_KEY = /^(api_?key|secret|access_?token|refresh_?token|authorization|proxy_?url)$/i;
 
 /**
  * JSON replacer that keeps credentials out of anything Rogue writes down or

@@ -25,6 +25,7 @@
     "@earendil-works/pi-coding-agent": "0.84.4",
     "@faker-js/faker": "^10.6.0",
     "nostr-tools": "^2.25.1",
+    "undici": "^8.9.0",
     "ws": "^8.21.3"
   },
   "devDependencies": {

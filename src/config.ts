@@ -1,5 +1,6 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
+import type { HttpProxySettings } from "./http-proxy.js";
 
 export interface ProviderRoute {
   provider: string;
@@ -18,6 +19,7 @@ export interface FailoverRecord {
 interface RogueConfig {
   providers: ProviderRoute[];
   failovers: FailoverRecord[];
+  httpProxy?: HttpProxySettings;
 }
 
 const EMPTY_CONFIG: RogueConfig = { providers: [], failovers: [] };
@@ -36,6 +38,7 @@ export class RogueConfigStore {
       return {
         providers: parsed.providers ?? [],
         failovers: parsed.failovers ?? [],
+        httpProxy: parsed.httpProxy,
       };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return structuredClone(EMPTY_CONFIG);
@@ -92,5 +95,18 @@ export class RogueConfigStore {
 
   async recentFailovers(): Promise<FailoverRecord[]> {
     return (await this.load()).failovers.slice(-20).reverse();
+  }
+
+  async getHttpProxy(): Promise<HttpProxySettings | undefined> {
+    const settings = (await this.load()).httpProxy;
+    return settings ? structuredClone(settings) : undefined;
+  }
+
+  async configureHttpProxy(settings: HttpProxySettings): Promise<void> {
+    await this.mutate((config) => { config.httpProxy = structuredClone(settings); });
+  }
+
+  async removeHttpProxy(): Promise<void> {
+    await this.mutate((config) => { delete config.httpProxy; });
   }
 }

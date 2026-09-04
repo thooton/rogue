@@ -5,6 +5,12 @@ import { RogueConfigStore } from "./config.js";
 import { createRogueModels } from "./provider-runtime.js";
 import { normalizeCustomProvider, saveCustomProvider, type CustomProviderDefinition } from "./custom-providers.js";
 import { NostrService } from "./nostr.js";
+import {
+  applyHttpProxy,
+  normalizeHttpProxySettings,
+  redactHttpProxyUrl,
+  type HttpProxySettings,
+} from "./http-proxy.js";
 
 interface InitialRoute {
   provider: string;
@@ -20,6 +26,7 @@ interface InitialAuthDocument {
   providers?: InitialRoute[];
   customProviders?: unknown[];
   relays?: string[];
+  httpProxy?: unknown;
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -80,7 +87,7 @@ export async function importInitialAuthentication(stateDirectory = ".rogue", exp
   const parsed = JSON.parse(await readFile(bootstrapPath, "utf8")) as unknown;
   if (!isObject(parsed)) throw new Error("initial_auth.json must contain a JSON object.");
   const hasStructuredKeys = "credentials" in parsed || "routes" in parsed || "providers" in parsed
-    || "customProviders" in parsed || "relays" in parsed;
+    || "customProviders" in parsed || "relays" in parsed || "httpProxy" in parsed;
   const document: InitialAuthDocument = hasStructuredKeys
     ? parsed as InitialAuthDocument
     : { credentials: parsed };
@@ -93,6 +100,9 @@ export async function importInitialAuthentication(stateDirectory = ".rogue", exp
     throw new Error("initial_auth.json customProviders must be an array.");
   }
   if (document.relays !== undefined && !Array.isArray(document.relays)) throw new Error("initial_auth.json relays must be an array.");
+  const httpProxy: HttpProxySettings | undefined = document.httpProxy === undefined
+    ? undefined
+    : normalizeHttpProxySettings(document.httpProxy);
   const customDefinitions: CustomProviderDefinition[] = (document.customProviders ?? []).map(normalizeCustomProvider);
   const relays = (document.relays ?? []).map((relay) => {
     if (typeof relay !== "string") throw new Error("Every initial_auth.json relay must be a URL string.");
@@ -112,10 +122,15 @@ export async function importInitialAuthentication(stateDirectory = ".rogue", exp
     if (route.credential !== undefined) credentialsByProvider.set(route.provider, normalizeCredential(route.credential, route.provider));
     else if (route.apiKey) credentialsByProvider.set(route.provider, { type: "api_key", key: route.apiKey });
   }
-  if (!credentialsByProvider.size && !routes.length && !relays.length && !customDefinitions.length) {
-    throw new Error("initial_auth.json must define at least one credential, provider route, custom provider, or relay.");
+  if (!credentialsByProvider.size && !routes.length && !relays.length && !customDefinitions.length && !httpProxy) {
+    throw new Error("initial_auth.json must define at least one credential, provider route, custom provider, relay, or HTTP proxy.");
   }
 
+  if (httpProxy) {
+    const config = new RogueConfigStore(stateDirectory);
+    await config.configureHttpProxy(httpProxy);
+    await applyHttpProxy(httpProxy);
+  }
   const { models, credentials, customProviders } = await createRogueModels(stateDirectory);
   // Custom endpoints are registered first: a credential or route in the same
   // file is allowed to name one, and a keyless local server is often the only
@@ -172,6 +187,7 @@ export async function importInitialAuthentication(stateDirectory = ".rogue", exp
   }
   if (configured.length) console.log(`Imported one-time authentication for ${configured.map((route) => `${route.provider}/${route.model}`).join(", ")}.`);
   if (relays.length) console.log(`Imported ${relays.length} Rogue Network relay${relays.length === 1 ? "" : "s"}.`);
+  if (httpProxy) console.log(`Imported HTTP proxy ${redactHttpProxyUrl(httpProxy.url)}.`);
   console.log(`Consumed and deleted ${bootstrapPath}.`);
   return true;
 }

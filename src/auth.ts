@@ -89,7 +89,7 @@ export function providerCatalogChoices(models: Models, configured: ReadonlySet<s
     return {
       id: provider.id,
       badge: provider.id,
-      label: `${provider.name}${ready ? `  ${ui.style.success("● credentials found")}` : ""}`,
+      label: `${provider.name}${ready ? `  ${ui.style.success("● ready")}` : ""}`,
       description: `${auth.join(" · ")} · ${count ? `${count} models` : "dynamic model catalog"}`,
       searchText: `${auth.join(" ")} ${ready ? "ready configured authenticated" : ""}`,
     };
@@ -179,7 +179,7 @@ async function selectAuthentication(provider: Provider, models: Models, forced?:
     id: "existing",
     label: "Use detected credentials",
     badge: "no sign-in needed",
-    description: `${existing.type === "oauth" ? "Signed-in account" : "API or local credentials"}${existing.source ? ` · ${existing.source}` : ""}`,
+    description: `${existing.type === "oauth" ? "Signed-in account" : "API, local, or free access"}${existing.source ? ` · ${existing.source}` : ""}`,
   });
   if (provider.auth.oauth) choices.push({
     id: "oauth",
@@ -426,7 +426,7 @@ export async function runProviderSetup(options: ProviderSetupOptions = {}): Prom
       ui.success(`${ui.style.faint("Model ·")} ${ui.style.bold(model.name || model.id)} ${ui.style.faint(model.id)}`);
     } else {
       const choice = await choose(`Choose a ${provider.name} model`, modelCatalogChoices(candidates), {
-        subtitle: "Only models your credentials can reach are listed.",
+        subtitle: "Only models available through your credentials or a keyless free tier are listed.",
         confirmLabel: "Model",
       });
       model = candidates.find((candidate) => candidate.id === choice.id);

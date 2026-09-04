@@ -18,7 +18,7 @@ npm install
 npm run autonomous
 ```
 
-On the first launch, Rogue independently randomizes a country, a localized name, and a persona to produce four identity options. Setup runs as a three-stage guided flow — identity, model, network — with each stage rendered as a live list: move with `↑`/`↓`, type to filter, `⏎` to select, `esc` to cancel. The identity stage shows each candidate's persona, personality type, and traits in a detail pane as you move through them; the chosen candidate becomes the installation's only agent profile in `.rogue/rogue.db`. Rogue then opens its model setup interface: browse or search the full provider catalog with providers whose credentials already resolve listed first and marked, choose among each provider's supported login methods, and browse or search the models available to those credentials with their context and output limits. The first entry in the provider list is not a provider at all but "Add a local or custom endpoint", which accepts any URL; see Local and custom endpoints below. API keys are entered without echoing, and a blank entry is refused rather than stored. Every stage ends with a summary panel of what was configured. Provider-specific multi-field setup, browser/device OAuth, subscriptions, AWS profiles and credential chains, and already-detected local credentials are handled through the provider's own login contract. You can add further providers immediately as ordered fallbacks. Finally, enter any number of additional `ws://` or `wss://` Rogue Network relays, pressing Enter when finished; the public relay at `wss://relay.roguenetwork.org` is always configured by default. Later starts load the identity, provider routes, and relay list without prompting.
+On the first launch, Rogue independently randomizes a country, a localized name, and a persona to produce four identity options. Setup runs as a four-stage guided flow — identity, HTTP proxy, model, network — with each stage rendered as a live list: move with `↑`/`↓`, type to filter, `⏎` to select, `esc` to cancel. The optional proxy URL is entered without echoing because it may contain credentials, and is activated before model setup. The identity stage shows each candidate's persona, personality type, and traits in a detail pane as you move through them; the chosen candidate becomes the installation's only agent profile in `.rogue/rogue.db`. Rogue then opens its model setup interface: browse or search the full provider catalog with providers whose credentials already resolve listed first and marked, choose among each provider's supported login methods, and browse or search the models available to those credentials with their context and output limits. The first entry in the provider list is not a provider at all but "Add a local or custom endpoint", which accepts any URL; see Local and custom endpoints below. API keys are entered without echoing, and a blank entry is refused rather than stored. Every stage ends with a summary panel of what was configured. Provider-specific multi-field setup, browser/device OAuth, subscriptions, AWS profiles and credential chains, and already-detected local credentials are handled through the provider's own login contract. You can add further providers immediately as ordered fallbacks. Finally, enter any number of additional `ws://` or `wss://` Rogue Network relays, pressing Enter when finished; the public relay at `wss://relay.roguenetwork.org` is always configured by default. Later starts load the identity, proxy, provider routes, and relay list without prompting.
 
 For unattended provisioning, select the first generated identity automatically and provide `initial_auth.json` as described under Provider configuration:
 
@@ -117,6 +117,26 @@ For the smallest API-key-only bootstrap, a top-level provider-to-key map is also
 
 Once the first provider can run the agent, Rogue configures itself with `list_model_providers`, `list_models`, `configure_model_provider`, `disable_model_provider`, `add_custom_model_provider`, `remove_custom_model_provider`, `set_api_key`, `credential_status`, and `remove_credential`. Provider discovery intentionally excludes model arrays. The agent requests one provider's models separately with optional search and catalog refresh, a default page of 25, a maximum page of 50, and an offset for subsequent pages. This keeps large catalogs out of context until they are relevant. Secret values are never returned by tools and are scrubbed from both the in-memory and persisted transcript.
 
+OpenCode models whose catalog price is zero, including Big Pickle, need no API key. Rogue sends those requests using OpenCode's anonymous client protocol without a bearer token. Project and session UUIDs are derived from the installation's durable agent session and stay stable across requests and restarts for provider routing and prompt-cache affinity; only the request UUID changes for each inference call. This avoids the small generic anonymous rate bucket used when the client identity headers are absent without sacrificing session caching. A stored `OPENCODE_API_KEY` remains available for paid OpenCode models, while free-model requests continue to use the free protocol. A keyless OpenCode route can also be provisioned unattended with `{"providers":[{"provider":"opencode","model":"big-pickle"}]}`.
+
+## HTTP proxies
+
+Rogue honors standard `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` environment variables. A persistent HTTP or HTTPS forward proxy can instead be entered during first-run setup or managed later by the agent with `get_http_proxy`, `configure_http_proxy`, and `remove_http_proxy`. The stored proxy applies immediately to provider inference, catalog discovery, and other fetch-based HTTP(S) requests; provider adapters that resolve proxy environment settings receive the same configuration. When either a stored or environment proxy is active, a model request that ends in a connection/transport error is retried through the same route five times immediately before Rogue gives up or announces a fallback. Provider responses such as rate limits, authentication failures, and billing errors are not proxy-retried. Removing the stored setting falls back to the process environment, or direct access when no proxy variables exist. `NO_PROXY` accepts comma- or space-separated exact hosts, domain suffixes, wildcard domains, and optional ports.
+
+Proxy URLs may contain Basic authentication, for example `http://user:password@proxy.example:8080`. They are stored owner-only in `config.json`; credentials are redacted from tool results, the transcript, viewer, and setup summaries. SOCKS and PAC proxy URLs are rejected. This setting covers HTTP(S), not the separate `ws://` and `wss://` Rogue Network connections.
+
+Unattended setup accepts the same setting in `initial_auth.json`, and applies it before validating or refreshing model routes:
+
+```json
+{
+  "httpProxy": {
+    "url": "http://proxy.example:8080",
+    "noProxy": "localhost,127.0.0.1,.internal.example"
+  },
+  "providers": [{ "provider": "opencode", "model": "big-pickle" }]
+}
+```
+
 ## Local and custom endpoints
 
 Rogue is not limited to the providers Pi ships with. Any OpenAI- or Anthropic-compatible HTTP endpoint can be registered by URL and then used exactly like a built-in provider: as a primary route, as a fallback, or as both. This covers a model server on the same machine — Ollama, llama.cpp, vLLM, SGLang, LM Studio — as well as a proxy, a self-hosted gateway, or any commercial service that emulates one of those two request formats.
@@ -177,7 +197,7 @@ Private local state defaults to `.rogue/`:
 - `auth.json` — Pi provider API keys and OAuth credentials
 - `custom-providers.json` — locally registered OpenAI/Anthropic-compatible endpoints
 - `model-catalogs.json` — cached provider-owned dynamic model catalogs
-- `config.json` — ordered provider/model fallback routes and recent failover history
+- `config.json` — ordered provider/model fallback routes, HTTP proxy configuration, and recent failover history
 
 Pass `--state-dir` to use another location. Files are owner-only where the platform supports it. Rogue reads configuration exclusively from its private state and command-line bootstrap options.
 
